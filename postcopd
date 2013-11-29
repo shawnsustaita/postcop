@@ -1,0 +1,531 @@
+#!/usr/bin/perl -W
+
+
+### MODULES
+use strict;
+use IO::File;
+use File::stat;
+use Sys::Syslog qw/setlogsock openlog syslog/;
+use Fcntl qw/:DEFAULT :flock/;
+use POSIX qw/setsid sysconf _SC_OPEN_MAX WNOHANG/;
+use IO::Socket::INET;
+use Net::SMTP;
+use Linux::Inotify2;
+use DBM::Deep;
+
+
+### CONFIGURATION FILE GLOBALS
+my $debug                = 0;
+my $foreground           = 1;
+my $alarm_time           = 5;
+my $jail_time            = 15;
+my $send_threshold       = 3;
+my $syslog_facility      = 'local0';
+my $syslog_priority      = 'warning';
+my $syslog_socktype      = 'unix';
+my $maillog_file         = '/var/log/mail.log';
+my $tmpworkdir           = '/var/lib/postcop/';
+my $pardon_file          = '/usr/local/etc/postcop/pardon';
+my $jail_file            = '/usr/local/etc/postcop/jail';
+my $pid_file             = '/var/run/postcopd.pid';
+my $sender_regex         = qr{postfix/qmgr\[\d+\]: (\w+): from=<(.*?)>, size=\d+, nrcpt=(\d+) \(queue active\)}io;
+my $action               = 'DISCARD';
+my $action_text          = "$action additional text here";
+my $inmate_msg           = "Email limit exceeded.";
+my $postmap              = "/usr/sbin/postmap $jail_file";
+my @scripts              = ();
+my $listen_port          = 666;
+my $listen_address       = '192.168.0.6';
+my @peers                = ();
+my $mailhost             = 'localhost';
+my $mailfrom             = 'postcop@localhost';
+my @admins               = ( 'root@localhost' );
+my $mydomain             = 'localhost';
+my $max_peer_connections = 2;
+
+
+### NON-CONFIGURATION FILE GLOBALS (INTERNALS)
+my $done = 0;
+my $alarm = 0;
+my $maillog_inode = -1;
+my $maillog_rotated = 0;
+my $pid_fh;
+my $maillog_fh;
+my $inotify;
+my $listener;
+my %sender_mail_ids;
+my %sender_mail_logs;
+my %sender_mail_counts;
+my %pardon_regexes;
+my %inmates;
+my %new_inmates;
+my %peer_inmates;
+
+
+### DECLARATIONS
+sub main;
+sub init_signals;
+sub init_syslog;
+sub daemonize;
+sub create_locked_pid_file;
+sub service_peer;
+sub child_tcp_listener;  # needs better name XXX (ie postcop_server)
+sub init_maillog;
+sub Log;
+sub tie_vars;
+sub untie_vars;
+sub open_file_with_lock;
+sub is_pardoned;
+sub is_inmate;
+sub is_peer_inmate;
+sub process_maillog;
+sub process_pardons;
+sub process_inmates;
+sub process_peer_inmates;
+sub process_new_inmates;
+sub process_jail_sentences;
+sub spawn;
+sub notify_admins;
+sub Die;
+sub cleanup;
+
+
+### MAIN
+main;
+
+
+### SUBROUTINES
+sub main {
+    $0 = 'postcopd';
+    init_signals;
+    $| = 1 if $foreground;
+    init_syslog unless $foreground;
+    Log "Postcop started.";
+    Log "Threshold rate set to $send_threshold emails per $alarm_time seconds.";
+    Log "Mail log processing is set to $alarm_time second intervals.";
+    daemonize unless $foreground;
+    create_locked_pid_file;
+    child_tcp_listener;
+    init_maillog;
+    while ( !$done ) {
+        tie_vars;
+        process_maillog;
+        process_pardons;
+        process_inmates;
+        process_peer_inmates;
+        process_new_inmates;
+        process_jail_sentences;
+        spawn $postmap;
+#        for my $script (@scripts) {
+#             my $inmate;
+#             while (($inmate, undef) = each %new_inmates) {
+#                 spawn "$script $inmate";
+#             }
+#             while (($inmate, undef) = each %peer_inmates) {
+#                 spawn "$script $inmate";
+#             }
+#        }
+#        notify_admins if %new_inmates;
+        untie_vars;
+    }
+    Log "Postcop finished.";
+    cleanup;
+    exit 0;
+}
+
+
+sub init_signals {
+    $SIG{ALRM} = sub { $alarm = 1; };
+    $SIG{HUP} = 'IGNORE';
+    $SIG{TERM} = $SIG{INT} = sub { $done = 1; };  # maybe include $alarm=1 XXX
+}
+
+
+sub init_syslog {
+    setlogsock $syslog_socktype or die "setlogsock failed ($syslog_socktype): $!";
+    openlog $0, 'pid', $syslog_facility;  # Will die on failure (perldoc Sys::Syslog)
+}
+
+
+sub daemonize {
+    ## Be inherited by init.
+    my $pid = fork;
+    $pid < 0 and Die "fork failed (daemonize): $!";
+    $pid > 0 and exit 0;  # Lose parent
+  
+    ## Set sane working directory and umask.
+    chdir '/' or Die "chdir failed: $!";
+    umask 022;
+  
+    ## Establish a new session
+    my $sid = setsid;
+    $sid < 0 and Die "setsid failed: $!";
+
+    ## Close whatever files that were previously open.
+    my $openmax = sysconf(_SC_OPEN_MAX);
+    $openmax > 0 or $openmax = 1024;
+    POSIX::close $_ for 0 .. $openmax;
+  
+    ## Open std{in,out,err} from/to /dev/null.
+    open STDIN,  '<', '/dev/null' or Die "open STDIN failed (/dev/null): $!";
+    open STDOUT, '>', '/dev/null' or Die "open STDOUT failed (/dev/null): $!";
+    open STDERR, '>', '/dev/null' or Die "open STDERR failed (/dev/null): $!";
+}
+
+
+sub create_locked_pid_file {
+    ## Ensure only one daemon runs at a time.  This lock lasts for the daemon's life.
+    ## $pid_fh is global so the filehandle lock doesn't go out of scope.
+    $pid_fh = open_file_with_lock $pid_file, O_RDWR|O_CREAT, LOCK_EX|LOCK_NB;
+    $pid_fh->truncate(0) or Die "truncate failed ($pid_file): $!";
+    $pid_fh->print("$$\n") or Die "write failed ($pid_file): $!";
+    $pid_fh->flush() or Die "flush failed ($pid_file): $!";
+}
+
+
+sub open_file_with_lock {
+    my ($file, $open_flags, $lock_type) = @_;
+    my $fh = IO::File->new($file, $open_flags) or Die "open failed ($file): $!";
+    flock $fh, $lock_type or Die "flock failed ($file): $!";
+    return $fh;
+}
+
+
+sub child_tcp_listener {
+    return unless @peers;
+
+    my $pid = fork;
+    $pid < 0 and Die "fork failed (child_tcp_listener): $!";
+    $pid > 0 and return;  # parent returns
+
+    close $pid_fh;
+    my $peer_connections = 0;
+
+    $SIG{ALRM} = 'IGNORE';
+
+    $listener = IO::Socket::INET->new(LocalAddr => $listen_address,
+                                      LocalPort => $listen_port,
+                                      Proto     => 'tcp',
+                                      Listen    => SOMAXCONN,
+                                      Reuse     => 1);
+    $listener or Die "listener failed ($listen_address:$listen_port): $!";
+    $listener->setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
+        or Die "setsockopt failed (SOL_SOCKET:SO_KEEPALIVE): $!";
+
+    # iterative server that spawns worker children
+    while ( !$done ) {
+        my $peer = $listener->accept;
+        next unless $peer;
+        if (++$peer_connections > $max_peer_connections) {
+            Log '$max_peer_connections threshold reached ('.$max_peer_connections.')';
+            Log 'ignoring connection ('.$peer->peerhost.')';
+            --$peer_connections;
+            next;
+        }
+        service_peer $peer;
+        close $peer;
+        --$peer_connections while (waitpid(-1, WNOHANG) > 0);
+    }
+    cleanup;
+    exit 0;
+}
+
+
+sub service_peer {
+    my $pid = fork;
+    $pid < 0 and Die "fork failed (service_peer): $!";
+    $pid > 0 and return;  # parent returns
+
+    close $listener;
+    my $peer = shift;
+
+    $SIG{ALRM} = $SIG{PIPE} = 'IGNORE';
+
+    unless (grep { $_ eq $peer->peerhost } @peers) {
+        Log "unrecognized peer connection (".$peer->peerhost.")";
+        close $peer or Die "close failed (peer): $!";
+        exit 0;
+    }
+
+    Log "sharing jailings with peer (".$peer->peerhost.")";
+    my $fh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
+    while (!$done and my $line = <$fh>) {
+        print $peer $line;
+    }
+    close $fh or Die "close failed ($jail_file): $!";
+    close $peer or Die "close failed (peer): $!";
+    exit 0;
+}
+
+
+sub init_maillog {
+    my $open_attempts = 5;
+    while ($open_attempts--) {
+        $maillog_fh = IO::File->new($maillog_file, O_RDONLY);
+        $maillog_fh and last;
+        sleep 1;
+    }
+    $maillog_fh or Die "open failed ($maillog_file): $!";
+    $maillog_inode = stat($maillog_fh)->ino or Die "stat failed: $!";
+    $inotify = Linux::Inotify2->new or Die "inotify new error: $!";
+    $inotify->watch(readlink('/proc/'.$$.'/fd/'.fileno($maillog_fh)), IN_ALL_EVENTS)
+        or Die "inotify watch error: $!";
+    if ($maillog_rotated) { $maillog_rotated = 0; }
+    else { $maillog_fh->seek(0, SEEK_END) or Die "seek failed ($maillog_file): $!"; }
+}
+
+
+sub Log {
+    my $log = shift;
+    if ($foreground) {
+        print '['.scalar(localtime(time)).'] '."$log\n";
+        STDOUT->flush;
+    }
+    else {
+        syslog $syslog_priority, $log;
+    }
+}
+
+
+sub tie_vars {
+    tie %sender_mail_counts, 'DBM::Deep', $tmpworkdir.'/sender_mail_counts.db'
+        or Die "Tie failed (sender_mail_counts): $!";
+    tie %sender_mail_ids, 'DBM::Deep', $tmpworkdir.'/sender_mail_ids.db'
+        or Die "Tie failed (sender_mail_ids): $!";
+    tie %sender_mail_logs, 'DBM::Deep', $tmpworkdir.'/sender_mail_logs.db'
+        or Die "Tie failed (sender_mail_logs): $!";
+    tie %inmates, 'DBM::Deep', $tmpworkdir.'/inmates.db'
+        or Die "Tie failed (inmates): $!";
+    tie %new_inmates, 'DBM::Deep', $tmpworkdir.'/new_inmates.db'
+        or Die "Tie failed (new_inmates): $!";
+    tie %peer_inmates, 'DBM::Deep', $tmpworkdir.'/peer_inmates.db'
+        or Die "Tie failed (peer_inmates): $!";
+    tie %pardon_regexes, 'DBM::Deep', $tmpworkdir.'/pardon_regexes.db'
+        or Die "Tie failed (pardon_regexes): $!";
+}
+
+
+sub untie_vars {
+    untie(%sender_mail_counts = ());
+    untie(%sender_mail_ids = ());
+    untie(%sender_mail_logs = ());
+    untie(%inmates = ());
+    untie(%new_inmates = ());
+    untie(%peer_inmates = ());
+    untie(%pardon_regexes = ());
+}
+
+
+sub process_maillog {
+    alarm $alarm_time;
+    while (!$alarm and !$done) {
+        my $line = <$maillog_fh>;
+        if ($maillog_fh->eof) {
+            $maillog_fh->clearerr;
+            $maillog_rotated = 1 if $maillog_file ne readlink('/proc/'.$$.'/fd/'.fileno($maillog_fh));
+            Log "maillog rotated" if $debug and $maillog_rotated;
+            init_maillog if $maillog_rotated;
+            $inotify->read unless $maillog_rotated;
+        }
+        next unless defined $line;
+        chomp $line;
+        next unless $line =~ /$sender_regex/i;
+        my ($mailid, $sender, $nrcpts) = ($1, lc $2, $3);
+        next unless defined $mailid;
+        next unless defined $sender;
+        next unless defined $nrcpts;
+        next if grep { $mailid =~ /^$_$/ } @{ $sender_mail_ids{$sender} };
+        Log 'push @{ $sender_mail_ids{'.$sender.'}, '.$mailid if $debug;
+        push @{ $sender_mail_ids{$sender}  }, $mailid;
+        Log 'push @{ $sender_mail_logs{'.$sender.'} }, '.$line if $debug;
+        push @{ $sender_mail_logs{$sender} }, $line;
+        Log '$sender_mail_counts{'.$sender.'} += '.$nrcpts if $debug;
+        $sender_mail_counts{$sender} += $nrcpts;
+    }
+    $alarm = 0;
+}
+
+
+sub process_pardons {
+    $pardon_regexes{$mailfrom} = '';
+    my $fh = open_file_with_lock $pardon_file, O_RDONLY|O_CREAT, LOCK_SH;
+    ## $line should be renamed to something better XXX (ie regex)
+    while (my $line = <$fh>) {  # verify good regexes XXX (ie eval qr/.../)
+        chomp $line;
+        Log '$pardon_regexes{'.$line."} = ''" if $debug;
+        $pardon_regexes{$line} = '';
+    }
+    close $fh or Die "close failed ($pardon_file)";
+}
+
+
+sub process_inmates {
+    my $now = time;
+    my $fh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
+    while (my $line = <$fh>) {
+        chomp $line;
+        unless ($line =~ /^(.*) $action_text \[([0-9]+)\]$/) {
+            Log "ignoring malformed jail entry or jail policy mis-match: $line";
+            next;
+        }
+        my ($sender, $then) = (lc $1, $2);
+        unless (defined($sender) and defined($then)) {
+            Log "ignoring malformed jail entry: $line";
+            next;
+        }
+        if ( ($now - $then) >= $jail_time ) {
+            Log "$sender has been freed from jail (sentence expired)";
+            next;
+        }
+        if (is_pardoned($sender)) {
+            Log "$sender has been freed from jail (pardoned)";
+            next;
+        }
+        Log '$inmates{'.$sender.'} = '.$line if $debug;
+        $inmates{$sender} = $line;
+    }
+    close $fh or Die "close failed ($jail_file): $!";
+}
+
+
+sub process_peer_inmates {
+    my $now = time;
+    for my $peer (@peers) {
+        my $sock = IO::Socket::INET->new(PeerAddr => $peer, PeerPort => $listen_port, Timeout  => 15);
+        unless ($sock) {
+            Log "sock failed ($peer:$listen_port): $!";
+            next;
+        }
+        while (<$sock>) {
+            chomp;
+
+            # jail policies (ie $action_text) must be identical for inmate transfers.
+            unless (/^(.*) $action_text \[([0-9]+)\]$/) {
+                Log "ignoring malformed jail entry or jail policy mis-match: $_";
+                next;
+            }
+            my ($sender, $then) = (lc $1, $2);
+            unless (defined($sender) and defined($then)) {
+                Log "ignoring malformed jail entry: $_";
+                next;
+            }
+            next if is_pardoned($sender);
+            next if is_inmate($sender);
+            Log "$sender has been sentenced jail time via peer collaboration ($peer)";
+            Log '$peer_inmates{'.$sender."} = $sender $action_text [$now]" if $debug;
+            $peer_inmates{$sender} = "$sender $action_text [$now]";
+        }
+        close $sock;
+    }
+}
+
+
+sub process_new_inmates {
+    my $now = time;
+    while (my ($sender, $count) = each %sender_mail_counts) {
+        next unless defined $sender;
+        next unless defined $count;
+        next if $count < $send_threshold;
+        next if is_pardoned($sender);
+        next if is_inmate($sender);
+        next if is_peer_inmate($sender);
+        Log "$sender has been sentenced jail time";
+        Log "$sender sent at a rate of $count emails per $alarm_time seconds";
+        if ($debug) {
+            for my $mail_log ( @{ $sender_mail_logs{$sender} } ) {
+                Log $mail_log;
+            }
+        }
+        Log '$new_inmates{'.$sender."} = $sender $action_text [$now]" if $debug;
+        $new_inmates{$sender} = "$sender $action_text [$now]";
+    }
+}
+
+
+sub process_jail_sentences {
+    my $fh = open_file_with_lock $jail_file, O_WRONLY|O_CREAT|O_TRUNC, LOCK_EX;
+    while (my (undef, $v) = each %inmates) {
+        Log 'print $jailfh '.$v if $debug;
+        print $fh "$v\n" or Die "write failed ($jail_file): $!";
+    }
+    while (my (undef, $v) = each %peer_inmates) {
+        Log 'print $jailfh '.$v if $debug;
+        print $fh "$v\n" or Die "write failed ($jail_file): $!";
+    }
+    while (my (undef, $v) = each %new_inmates) {
+        Log 'print $jailfh '.$v if $debug;
+        print $fh "$v\n" or Die "write failed ($jail_file): $!";
+    }
+    close $fh or Die "close failed ($jail_file): $!";
+}
+
+
+sub spawn {
+    my $cmd = shift;
+    my $ret = system($cmd);
+    Log "$cmd: returned nonzero value ($ret): $!" unless $ret == 0;
+}
+
+
+sub notify_admins {
+    my $smtp;
+    unless ($smtp = Net::SMTP->new($mailhost) ) {
+        Log "smtp new failed ($mailhost): $!";
+        return;
+    }
+    unless ($smtp->mail($mailfrom)) {
+        Log "smtp sender failed ($mailfrom): $!";
+        return;
+    }
+    unless ($smtp->recipient(@admins, { Notify => ['NEVER'], SkipBad => 1 })) {
+        Log 'smtp recipient failed ('.join(',', @admins)."): $!";
+        return;
+    }
+    my $msg = "Subject: Postcop Jail Sentences\n\n";
+    while (my ($k, undef) = each %new_inmates) {
+        $msg .= "$k\n";
+    }
+    unless ($smtp->data($msg)) {
+        Log "smtp data failed ($msg): $!";
+        return;
+    }
+    unless ($smtp->quit) {
+        Log "smtp quit failed: $!";
+        return;
+    }
+}
+
+
+sub Die {
+    my $msg = shift;
+    Log $msg;
+    Log "postcop died unexpectedly";
+    cleanup;
+    exit 1;
+}
+
+
+sub cleanup {
+    kill -15, getpgrp;
+    unlink $pid_file;
+}
+
+
+sub is_pardoned {
+    my $sender = shift;
+    return defined $pardon_regexes{$sender};
+}
+
+
+sub is_inmate {
+    my $sender = shift;
+    return defined $inmates{$sender};
+}
+
+
+sub is_peer_inmate {
+    my $sender = shift;
+    return defined $peer_inmates{$sender};
+}
+
+
