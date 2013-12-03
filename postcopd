@@ -41,7 +41,7 @@ my $listen_address       = '192.168.0.6';
 my @peers                = ();
 my $mydomain             = 'localhost';
 my $mailhost             = $mydomain;
-my $mailfrom             = "postcop\@$mydomain";
+my $postcop             = "postcop\@$mydomain";
 my @admins               = ( "root\@$mydomain" );
 my $max_peer_connections = 2;
 
@@ -80,7 +80,7 @@ sub open_file_with_lock;
 sub is_pardoned;
 sub is_inmate;
 sub is_peer_inmate;
-sub process_maillog;
+sub process_maillogs;
 sub process_pardons;
 sub process_inmates;
 sub process_peer_inmates;
@@ -110,7 +110,7 @@ sub main {
     Log "Mail log processing is set to $alarm_time second intervals.";
     while ( !$done ) {
         tie_vars;
-        process_maillog;
+        process_maillogs;
         process_pardons;
         process_inmates;
         process_peer_inmates;
@@ -369,7 +369,7 @@ sub untie_vars {
 }
 
 
-sub process_maillog {
+sub process_maillogs {
     # Set the interval for monitoring the mail log.
     # Read and process the mail log through interval duration.
     alarm $alarm_time;
@@ -441,15 +441,27 @@ sub process_maillog {
 
 
 sub process_pardons {
-    $pardon_regexes{$mailfrom} = '';
-    my $fh = open_file_with_lock $pardon_file, O_RDONLY|O_CREAT, LOCK_SH;
-    ## $line should be renamed to something better XXX (ie regex)
-    while (my $line = <$fh>) {  # verify good regexes XXX (ie eval qr/.../)
+    # Postcop is above the law; Pardon $postcop.
+    $pardon_regexes{$postcop} = '';
+
+    # Parse the pardon file.  File consists of line separated regexps.
+    my $pardonfh = open_file_with_lock $pardon_file, O_RDONLY|O_CREAT, LOCK_SH;
+    while (my $line = <$pardonfh>) {  # verify good regexes XXX (ie eval qr/.../)
+        # Remove newline.
         chomp $line;
-        Log '$pardon_regexes{'.$line."} = ''" if $debug;
+
+        # Verify the regular expression is valid.
+        eval { my $is_valid_regexp = qr/$line/; };
+        if ($@) {  # Invalid regular expression.
+            Log "Invalid regular expression (pardon file): $line";
+            next;
+        }
+
+        # Populate data structures for later processing.
+        Log "$pardon_regexes{$line} = ''" if $debug;
         $pardon_regexes{$line} = '';
     }
-    close $fh or Die "close failed ($pardon_file)";
+    close $pardonfh or Die "close failed ($pardon_file)";
 }
 
 sub process_inmates {
@@ -566,8 +578,8 @@ sub notify_admins {
         Log "smtp new failed ($mailhost): $!";
         return;
     }
-    unless ($smtp->mail($mailfrom)) {
-        Log "smtp sender failed ($mailfrom): $!";
+    unless ($smtp->mail($postcop)) {
+        Log "smtp sender failed ($postcop): $!";
         return;
     }
     unless ($smtp->recipient(@admins, { Notify => ['NEVER'], SkipBad => 1 })) {
