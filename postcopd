@@ -453,7 +453,7 @@ sub process_pardons {
         # Verify the regular expression is valid.
         eval { my $is_valid_regexp = qr/$line/; };
         if ($@) {  # Invalid regular expression.
-            Log "Invalid regular expression (pardon file): $line";
+            Log "Invalid regular expression ($pardon_file): $line";
             next;
         }
 
@@ -462,6 +462,8 @@ sub process_pardons {
         $pardon_regexes{$line} = '';
     }
     close $pardonfh or Die "close failed ($pardon_file)";
+
+    return;
 }
 
 sub process_inmates {
