@@ -1,17 +1,19 @@
-#!/usr/bin/perl -W
+#!/usr/bin/perl
 
 
 ### MODULES
 use strict;
+use warnings;
 use IO::File;
 use File::stat;
-use Sys::Syslog qw/setlogsock openlog syslog/;
-use Fcntl qw/:DEFAULT :flock/;
-use POSIX qw/setsid sysconf _SC_OPEN_MAX WNOHANG/;
+use Sys::Syslog       qw/setlogsock openlog syslog/;
+use Fcntl             qw/:DEFAULT :flock/;
+use POSIX             qw/setsid sysconf _SC_OPEN_MAX WNOHANG/;
 use IO::Socket::INET;
 use Net::SMTP;
 use Linux::Inotify2;
 use DBM::Deep;
+use List::MoreUtils   qw/any none/;
 
 
 ### CONFIGURATION FILE GLOBALS
@@ -28,7 +30,7 @@ my $tmpworkdir           = '/var/lib/postcop/';
 my $pardon_file          = '/usr/local/etc/postcop/pardon';
 my $jail_file            = '/usr/local/etc/postcop/jail';
 my $pid_file             = '/var/run/postcopd.pid';
-my $sender_regex         = qr{postfix/qmgr\[\d+\]: (\w+): from=<(.*?)>, size=\d+, nrcpt=(\d+) \(queue active\)}io;
+my $maillog_regexp       = qr{postfix/qmgr\[\d+\]: (\w+): from=<(.*?)>, size=\d+, nrcpt=(\d+) \(queue active\)}io;
 my $action               = 'DISCARD';
 my $action_text          = "$action additional text here";
 my $inmate_msg           = "Email limit exceeded.";
@@ -37,18 +39,18 @@ my @scripts              = ();
 my $listen_port          = 666;
 my $listen_address       = '192.168.0.6';
 my @peers                = ();
-my $mailhost             = 'localhost';
-my $mailfrom             = 'postcop@localhost';
-my @admins               = ( 'root@localhost' );
 my $mydomain             = 'localhost';
+my $mailhost             = $mydomain;
+my $mailfrom             = "postcop\@$mydomain";
+my @admins               = ( "root\@$mydomain" );
 my $max_peer_connections = 2;
 
 
 ### NON-CONFIGURATION FILE GLOBALS (INTERNALS)
-my $done = 0;
-my $alarm = 0;
-my $maillog_inode = -1;
-my $maillog_rotated = 0;
+my $done                 =  0;
+my $alarm                =  0;
+my $maillog_rotated      =  0;
+my $maillog_inode        = -1;
 my $pid_fh;
 my $maillog_fh;
 my $inotify;
@@ -69,7 +71,7 @@ sub init_syslog;
 sub daemonize;
 sub create_locked_pid_file;
 sub service_peer;
-sub child_tcp_listener;  # needs better name XXX (ie postcop_server)
+sub tcp_network_server;
 sub init_maillog;
 sub Log;
 sub tie_vars;
@@ -96,17 +98,16 @@ main;
 
 ### SUBROUTINES
 sub main {
-    $0 = 'postcopd';
+    $0 = 'postcopd';   # Set appropriate program name.
     init_signals;
-    $| = 1 if $foreground;
-    init_syslog unless $foreground;
+    $| = 1             if  $foreground;  # Autoflush if $foreground.
+    init_syslog        if !$foreground;
+    daemonize          if !$foreground;
+    tcp_network_server if  @peers;
+    init_maillog;
     Log "Postcop started.";
     Log "Threshold rate set to $send_threshold emails per $alarm_time seconds.";
     Log "Mail log processing is set to $alarm_time second intervals.";
-    daemonize unless $foreground;
-    create_locked_pid_file;
-    child_tcp_listener;
-    init_maillog;
     while ( !$done ) {
         tie_vars;
         process_maillog;
@@ -135,51 +136,59 @@ sub main {
 
 
 sub init_signals {
-    $SIG{ALRM} = sub { $alarm = 1; };
     $SIG{HUP} = 'IGNORE';
-    $SIG{TERM} = $SIG{INT} = sub { $done = 1; };  # maybe include $alarm=1 XXX
+    $SIG{ALRM} = sub { $alarm = 1; };
+    $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
+    return;
 }
 
 
 sub init_syslog {
     setlogsock $syslog_socktype or die "setlogsock failed ($syslog_socktype): $!";
     openlog $0, 'pid', $syslog_facility;  # Will die on failure (perldoc Sys::Syslog)
+    return;
 }
 
 
 sub daemonize {
-    ## Be inherited by init.
+    # Be inherited by init.
     my $pid = fork;
     $pid < 0 and Die "fork failed (daemonize): $!";
     $pid > 0 and exit 0;  # Lose parent
   
-    ## Set sane working directory and umask.
+    # Set sane working directory and umask.
     chdir '/' or Die "chdir failed: $!";
     umask 022;
   
-    ## Establish a new session
+    # Establish a new session.
     my $sid = setsid;
     $sid < 0 and Die "setsid failed: $!";
 
-    ## Close whatever files that were previously open.
+    # Close whatever files that were previously open.
     my $openmax = sysconf(_SC_OPEN_MAX);
     $openmax > 0 or $openmax = 1024;
     POSIX::close $_ for 0 .. $openmax;
   
-    ## Open std{in,out,err} from/to /dev/null.
+    # Open std{in,out,err} from/to /dev/null.
     open STDIN,  '<', '/dev/null' or Die "open STDIN failed (/dev/null): $!";
     open STDOUT, '>', '/dev/null' or Die "open STDOUT failed (/dev/null): $!";
     open STDERR, '>', '/dev/null' or Die "open STDERR failed (/dev/null): $!";
+
+    # Ensure only a single daemon via locked pid file.
+    create_locked_pid_file;
+
+    return;
 }
 
 
+## Ensure only one daemon runs at a time.  This lock lasts for the daemon's life.
+## $pid_fh is global so the filehandle lock doesn't go out of scope.
 sub create_locked_pid_file {
-    ## Ensure only one daemon runs at a time.  This lock lasts for the daemon's life.
-    ## $pid_fh is global so the filehandle lock doesn't go out of scope.
     $pid_fh = open_file_with_lock $pid_file, O_RDWR|O_CREAT, LOCK_EX|LOCK_NB;
-    $pid_fh->truncate(0) or Die "truncate failed ($pid_file): $!";
+    $pid_fh->truncate(0)   or Die "truncate failed ($pid_file): $!";
     $pid_fh->print("$$\n") or Die "write failed ($pid_file): $!";
-    $pid_fh->flush() or Die "flush failed ($pid_file): $!";
+    $pid_fh->flush()       or Die "flush failed ($pid_file): $!";
+    return;
 }
 
 
@@ -191,74 +200,104 @@ sub open_file_with_lock {
 }
 
 
-sub child_tcp_listener {
-    return unless @peers;
-
+sub tcp_network_server {
+    # Spawn child network server.
     my $pid = fork;
-    $pid < 0 and Die "fork failed (child_tcp_listener): $!";
-    $pid > 0 and return;  # parent returns
+    $pid < 0 and Die "fork failed (tcp_network_server): $!";
+    $pid > 0 and return;  # parent
+    # child...
 
-    close $pid_fh;
-    my $peer_connections = 0;
-
+    # Adjust signals accordingly.
     $SIG{ALRM} = 'IGNORE';
 
+    # For parent only.
+    close $pid_fh or Die "close failed ($pid_file): $!";
+
+    # Create tcp network server.
     $listener = IO::Socket::INET->new(LocalAddr => $listen_address,
                                       LocalPort => $listen_port,
                                       Proto     => 'tcp',
                                       Listen    => SOMAXCONN,
                                       Reuse     => 1);
     $listener or Die "listener failed ($listen_address:$listen_port): $!";
+
+    # KEEPALIVE will detect dead peer connections.
     $listener->setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
         or Die "setsockopt failed (SOL_SOCKET:SO_KEEPALIVE): $!";
 
-    # iterative server that spawns worker children
+    # Keep track of the number of peer connections.
+    my $peer_connections = 0;
+
+    # Iterative server that spawns worker children.
     while ( !$done ) {
+        # Accept new peer connection.
         my $peer = $listener->accept;
-        next unless $peer;
-        if (++$peer_connections > $max_peer_connections) {
-            Log '$max_peer_connections threshold reached ('.$max_peer_connections.')';
-            Log 'ignoring connection ('.$peer->peerhost.')';
-            --$peer_connections;
+        next if !$peer;
+
+        # Don't exceed max number of peer connections.
+        $peer_connections++;
+        if ($peer_connections > $max_peer_connections) {
+            Log "maximum peer connections reached ($max_peer_connections)";
+            Log "ignoring connection ($peer->peerhost)";
+            $peer_connections--;
             next;
         }
+
+        # Service_peer spawns a child worker to service peer.
         service_peer $peer;
-        close $peer;
-        --$peer_connections while (waitpid(-1, WNOHANG) > 0);
+
+        # Reap zombies and adjust peer connection count accordingly.
+        $peer_connections-- while (waitpid(-1, WNOHANG) > 0);
     }
+
     cleanup;
     exit 0;
 }
 
 
 sub service_peer {
-    my $pid = fork;
-    $pid < 0 and Die "fork failed (service_peer): $!";
-    $pid > 0 and return;  # parent returns
-
-    close $listener;
+    # Grab peer connection.
     my $peer = shift;
 
+    # Spawn a child worker to service peer.
+    my $pid = fork;
+    $pid < 0 and Die "fork failed (service_peer): $!";
+    if ($pid > 0) {  # Parent.
+        # For child only.  Parent can close.
+        close $peer or Die "close failed (parent peer): $!";
+        return;
+    }
+    # Child...
+
+    # For parent only.  Child can close.
+    close $listener or Die "close failed (listener): $!";
+
+    # Adjust signals accordingly.
     $SIG{ALRM} = $SIG{PIPE} = 'IGNORE';
 
-    unless (grep { $_ eq $peer->peerhost } @peers) {
-        Log "unrecognized peer connection (".$peer->peerhost.")";
-        close $peer or Die "close failed (peer): $!";
+    # Only service recognized peers.
+    if (none { $peer->peerhost eq $_ } @peers) {
+        Log "unrecognized peer connection ($peer->peerhost)";
+        close $peer or Die "close failed (unrecognized peer $peer->peerhost): $!";
         exit 0;
     }
 
-    Log "sharing jailings with peer (".$peer->peerhost.")";
-    my $fh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
-    while (!$done and my $line = <$fh>) {
+    Log "sharing jailings with peer ($peer->peerhost)";
+
+    # Share your jailings with peer.
+    my $jailfh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
+    while (!$done and my $line = <$jailfh>) {
         print $peer $line;
     }
-    close $fh or Die "close failed ($jail_file): $!";
-    close $peer or Die "close failed (peer): $!";
+    close $jailfh or Die "close failed ($jail_file): $!";
+    close $peer   or Die "close failed (child peer): $!";
+
     exit 0;
 }
 
 
 sub init_maillog {
+    # Open mail log.
     my $open_attempts = 5;
     while ($open_attempts--) {
         $maillog_fh = IO::File->new($maillog_file, O_RDONLY);
@@ -266,12 +305,25 @@ sub init_maillog {
         sleep 1;
     }
     $maillog_fh or Die "open failed ($maillog_file): $!";
+
+    # The inode is used to deduce when a log rotation occurs.
     $maillog_inode = stat($maillog_fh)->ino or Die "stat failed: $!";
+
+    # When processing the mail log and there's no activity, go to sleep until
+    # a mail log event occurs via the Linux inotify mechanism.  Perhaps this
+    # is better than just explicitly sleeping for a set time period.
     $inotify = Linux::Inotify2->new or Die "inotify new error: $!";
     $inotify->watch(readlink('/proc/'.$$.'/fd/'.fileno($maillog_fh)), IN_ALL_EVENTS)
         or Die "inotify watch error: $!";
-    if ($maillog_rotated) { $maillog_rotated = 0; }
-    else { $maillog_fh->seek(0, SEEK_END) or Die "seek failed ($maillog_file): $!"; }
+
+    # Log rotated so start at beginning (not end) of new log file.
+    if ($maillog_rotated) {
+        $maillog_rotated = 0;
+    }
+    # Postcop just started so seek to end of current log file for processing.
+    else {
+        $maillog_fh->seek(0, SEEK_END) or Die "seek failed ($maillog_file): $!";
+    }
 }
 
 
@@ -287,6 +339,7 @@ sub Log {
 }
 
 
+# Hashes are tied to files for the purpose of avoiding memory exhaustion.
 sub tie_vars {
     tie %sender_mail_counts, 'DBM::Deep', $tmpworkdir.'/sender_mail_counts.db'
         or Die "Tie failed (sender_mail_counts): $!";
@@ -317,32 +370,73 @@ sub untie_vars {
 
 
 sub process_maillog {
+    # Set the interval for monitoring the mail log.
+    # Read and process the mail log through interval duration.
     alarm $alarm_time;
     while (!$alarm and !$done) {
+        # Attempt to read a line from the mail log.
         my $line = <$maillog_fh>;
+
+        # Handle end of file situation.
         if ($maillog_fh->eof) {
+            # Ignore EOF (Clear EOF state).
             $maillog_fh->clearerr;
-            $maillog_rotated = 1 if $maillog_file ne readlink('/proc/'.$$.'/fd/'.fileno($maillog_fh));
+
+            # If log rotated, set an indicator flag.
+            if ($maillog_file ne readlink('/proc/'.$$.'/fd/'.fileno($maillog_fh))) {
+                $maillog_rotated = 1;
+            }
+
             Log "maillog rotated" if $debug and $maillog_rotated;
-            init_maillog if $maillog_rotated;
-            $inotify->read unless $maillog_rotated;
+
+            # if EOF and log rotated, open new log.
+            if ($maillog_rotated) {
+                init_maillog;
+            }
+            # if EOF and log not rotated, sleep until next log event.
+            else {
+                $inotify->read;
+            }
         }
-        next unless defined $line;
+
+        # EOF will render an undefined line.  Try read again.
+        next if !defined $line;
+
+        # Remove newline.
         chomp $line;
-        next unless $line =~ /$sender_regex/i;
+
+        # Parse log line.  Find and extract the mail ID, sender
+        # and number of recipients.  This regular expression is
+        # critical to the functionality of Postcop and needs to
+        # be tailored to your version of Postfix logs.
+        # $maillog_regexp is a global variable that can be found
+        # toward the beginning of this Postcop program.
+        next if $line !~ $maillog_regexp;
+
+        # Disregard bogus data.  Postcop requires all three.
+        next if !defined $1;
+        next if !defined $2;
+        next if !defined $3;
+
+        # Assign extracted data to appropriate variables.
         my ($mailid, $sender, $nrcpts) = ($1, lc $2, $3);
-        next unless defined $mailid;
-        next unless defined $sender;
-        next unless defined $nrcpts;
-        next if grep { $mailid =~ /^$_$/ } @{ $sender_mail_ids{$sender} };
-        Log 'push @{ $sender_mail_ids{'.$sender.'}, '.$mailid if $debug;
+
+        # Disregard logs with duplicate mail IDs.
+        next if any { $mailid eq $_ } @{ $sender_mail_ids{$sender} };
+
+        # Populate data structures for later processing.
+        Log 'push @{ $sender_mail_ids{'.$sender.'} }, '.$mailid if $debug;
         push @{ $sender_mail_ids{$sender}  }, $mailid;
+
         Log 'push @{ $sender_mail_logs{'.$sender.'} }, '.$line if $debug;
         push @{ $sender_mail_logs{$sender} }, $line;
+
         Log '$sender_mail_counts{'.$sender.'} += '.$nrcpts if $debug;
         $sender_mail_counts{$sender} += $nrcpts;
     }
-    $alarm = 0;
+    $alarm = 0;  # Reset alarm flag.
+
+    return;
 }
 
 
@@ -357,7 +451,6 @@ sub process_pardons {
     }
     close $fh or Die "close failed ($pardon_file)";
 }
-
 
 sub process_inmates {
     my $now = time;
