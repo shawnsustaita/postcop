@@ -58,7 +58,7 @@ my $listener;
 my %sender_mail_ids;
 my %sender_mail_logs;
 my %sender_mail_counts;
-my %pardon_regexes;
+my %pardons;
 my %inmates;
 my %new_inmates;
 my %peer_inmates;
@@ -353,8 +353,8 @@ sub tie_vars {
         or Die "Tie failed (new_inmates): $!";
     tie %peer_inmates, 'DBM::Deep', $tmpworkdir.'/peer_inmates.db'
         or Die "Tie failed (peer_inmates): $!";
-    tie %pardon_regexes, 'DBM::Deep', $tmpworkdir.'/pardon_regexes.db'
-        or Die "Tie failed (pardon_regexes): $!";
+    tie %pardons, 'DBM::Deep', $tmpworkdir.'/pardons.db'
+        or Die "Tie failed (pardons): $!";
 }
 
 
@@ -365,7 +365,7 @@ sub untie_vars {
     untie(%inmates = ());
     untie(%new_inmates = ());
     untie(%peer_inmates = ());
-    untie(%pardon_regexes = ());
+    untie(%pardons = ());
 }
 
 
@@ -442,7 +442,7 @@ sub process_maillogs {
 
 sub process_pardons {
     # Postcop is above the law; Pardon $postcop.
-    $pardon_regexes{$postcop} = '';
+    $pardons{$postcop} = '';  # XXX can I leave value undef?
 
     # Parse the pardon file.  File consists of line separated regexps.
     my $pardonfh = open_file_with_lock $pardon_file, O_RDONLY|O_CREAT, LOCK_SH;
@@ -452,14 +452,14 @@ sub process_pardons {
 
         # Verify the regular expression is valid.
         eval { my $is_valid_regexp = qr/$line/; };
-        if ($@) {  # Invalid regular expression.
+        if ($@) {
             Log "Invalid regular expression ($pardon_file): $line";
             next;
         }
 
         # Populate data structures for later processing.
-        Log "$pardon_regexes{$line} = ''" if $debug;
-        $pardon_regexes{$line} = '';
+        Log "$pardons{$line} = ''" if $debug;
+        $pardons{$line} = '';
     }
     close $pardonfh or Die "close failed ($pardon_file)";
 
@@ -467,63 +467,104 @@ sub process_pardons {
 }
 
 sub process_inmates {
+    # Time now is for calculating current jail durations.
     my $now = time;
-    my $fh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
-    while (my $line = <$fh>) {
+
+    # Interate inmates.
+    # Determine if inmates are freed or not.
+    my $jailfh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
+    while (my $line = <$jailfh>) {
+        # Remove newline.
         chomp $line;
-        unless ($line =~ /^(.*) $action_text \[([0-9]+)\]$/) {
+
+        # Match a valid jail entry or ignore it verbosely.
+        if ($line !~ /^(.*) $action_text \[([0-9]+)\]$/) {
             Log "ignoring malformed jail entry or jail policy mis-match: $line";
             next;
         }
+
+        # Assign extracted data to appropriate variables.
         my ($sender, $then) = (lc $1, $2);
-        unless (defined($sender) and defined($then)) {
+
+        # Verify good data or ignore verbosely.
+        if (!defined($sender) and !defined($then)) {
             Log "ignoring malformed jail entry: $line";
             next;
         }
+
+        # Free inmates that served their jail sentence.
         if ( ($now - $then) >= $jail_time ) {
             Log "$sender has been freed from jail (sentence expired)";
             next;
         }
+
+        # Free inmates that have been pardoned.
         if (is_pardoned($sender)) {
             Log "$sender has been freed from jail (pardoned)";
             next;
         }
-        Log '$inmates{'.$sender.'} = '.$line if $debug;
+
+        # Populate data structures for later processing.
+        Log "$inmates{$sender} = $line" if $debug;
         $inmates{$sender} = $line;
     }
-    close $fh or Die "close failed ($jail_file): $!";
+    close $jailfh or Die "close failed ($jail_file): $!";
+
+    return;
 }
 
 
 sub process_peer_inmates {
+    # Time now if for timestamping peer jail transfers.
     my $now = time;
-    for my $peer (@peers) {
-        my $sock = IO::Socket::INET->new(PeerAddr => $peer, PeerPort => $listen_port, Timeout  => 15);
-        unless ($sock) {
-            Log "sock failed ($peer:$listen_port): $!";
-            next;
-        }
-        while (<$sock>) {
-            chomp;
 
-            # jail policies (ie $action_text) must be identical for inmate transfers.
-            unless (/^(.*) $action_text \[([0-9]+)\]$/) {
-                Log "ignoring malformed jail entry or jail policy mis-match: $_";
-                next;
+    # Iterate peers.
+    # Determine if inmate transfers are required or not.
+    PEERS:
+    for my $peer (@peers) {
+        # Create TCP network connection to peer.
+        my $sock = IO::Socket::INET->new(PeerAddr => $peer, PeerPort => $listen_port, Timeout  => 15);
+
+        # Verify a good socket.
+        if (!$sock) {
+            Log "sock failed ($peer:$listen_port): $!";
+            next PEERS;
+        }
+
+        # Iterate peer jailings.
+        JAILINGS:
+        while (my $line = <$sock>) {
+            # Remove newline.
+            chomp $line;
+
+            # Jail policies (ie $action_text) must be identical for inmate transfers.
+            if ($line !~ /^(.*) $action_text \[([0-9]+)\]$/) {
+                Log "ignoring malformed jail entry or jail policy mis-match: $line";
+                next JAILINGS;
             }
+            
+            # Assign extracted data to appropriate variables.
             my ($sender, $then) = (lc $1, $2);
-            unless (defined($sender) and defined($then)) {
-                Log "ignoring malformed jail entry: $_";
-                next;
+
+            # Verify good data or ignore verbosely.
+            if (!defined($sender) and !defined($then)) {
+                Log "ignoring malformed jail entry: $line";
+                next JAILINGS;
             }
+
+            # Local jail policies take precedence.
+            # If peer inmate is already locally jailed or pardoned, ignore peer inmate.
             next if is_pardoned($sender);
             next if is_inmate($sender);
+
+            # Populate data structures for later processing.
             Log "$sender has been sentenced jail time via peer collaboration ($peer)";
             Log '$peer_inmates{'.$sender."} = $sender $action_text [$now]" if $debug;
             $peer_inmates{$sender} = "$sender $action_text [$now]";
-        }
+        }  # end JAILINGS
         close $sock;
-    }
+    }  # end PEERS
+    return;
 }
 
 
@@ -613,14 +654,14 @@ sub Die {
 
 
 sub cleanup {
-    kill -15, getpgrp;
+    kill -15, getpgrp;  # sig TERM to process group.
     unlink $pid_file;
 }
 
 
 sub is_pardoned {
     my $sender = shift;
-    return defined $pardon_regexes{$sender};
+    return defined $pardons{$sender};
 }
 
 
