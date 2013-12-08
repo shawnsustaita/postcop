@@ -181,9 +181,9 @@ sub daemonize {
 }
 
 
-## Ensure only one daemon runs at a time.  This lock lasts for the daemon's life.
-## $pid_fh is global so the filehandle lock doesn't go out of scope.
 sub create_locked_pid_file {
+    ## Ensure only one daemon runs at a time.  This lock lasts for the daemon's life.
+    ## $pid_fh is global so the filehandle lock doesn't go out of scope.
     $pid_fh = open_file_with_lock $pid_file, O_RDWR|O_CREAT, LOCK_EX|LOCK_NB;
     $pid_fh->truncate(0)   or Die "truncate failed ($pid_file): $!";
     $pid_fh->print("$$\n") or Die "write failed ($pid_file): $!";
@@ -444,6 +444,7 @@ sub process_pardons {
     # Postcop is above the law; Pardon $postcop.
     $pardons{$postcop} = '';  # XXX can I leave value undef?
 
+    # Iterate pardons.
     # Parse the pardon file.  File consists of line separated regexps.
     my $pardonfh = open_file_with_lock $pardon_file, O_RDONLY|O_CREAT, LOCK_SH;
     while (my $line = <$pardonfh>) {  # verify good regexes XXX (ie eval qr/.../)
@@ -515,7 +516,7 @@ sub process_inmates {
 
 
 sub process_peer_inmates {
-    # Time now if for timestamping peer jail transfers.
+    # Time now is for timestamping peer jail transfers.
     my $now = time;
 
     # Iterate peers.
@@ -559,7 +560,7 @@ sub process_peer_inmates {
 
             # Populate data structures for later processing.
             Log "$sender has been sentenced jail time via peer collaboration ($peer)";
-            Log '$peer_inmates{'.$sender."} = $sender $action_text [$now]" if $debug;
+            Log "\$peer_inmates{$sender} = $sender $action_text [$now]" if $debug;
             $peer_inmates{$sender} = "$sender $action_text [$now]";
         }  # end JAILINGS
         close $sock;
@@ -569,14 +570,24 @@ sub process_peer_inmates {
 
 
 sub process_new_inmates {
+    # Time now is for timestamping peer jail transfers.
     my $now = time;
+
+    # Iterate new senders.
+    # Determine who goes to jail.
     while (my ($sender, $count) = each %sender_mail_counts) {
-        next unless defined $sender;
-        next unless defined $count;
+        # Verify good data.
+        next if !defined $sender;
+        next if !defined $count;
+
+        # Ignore compliant senders.
         next if $count < $send_threshold;
+
+        # Ignore sender if already processed.
         next if is_pardoned($sender);
         next if is_inmate($sender);
         next if is_peer_inmate($sender);
+
         Log "$sender has been sentenced jail time";
         Log "$sender sent at a rate of $count emails per $alarm_time seconds";
         if ($debug) {
@@ -584,38 +595,45 @@ sub process_new_inmates {
                 Log $mail_log;
             }
         }
-        Log '$new_inmates{'.$sender."} = $sender $action_text [$now]" if $debug;
+
+        # Populate data structures for later processing.
+        Log "\$new_inmates{$sender} = $sender $action_text [$now]" if $debug;
         $new_inmates{$sender} = "$sender $action_text [$now]";
     }
 }
 
 
 sub process_jail_sentences {
-    my $fh = open_file_with_lock $jail_file, O_WRONLY|O_CREAT|O_TRUNC, LOCK_EX;
+    # Iterate through processed data structures and perform jailings.
+    # In other words, write the postfix access rules to the postmap'able
+    # jail file.  The postmap command will later be executed on the jail file
+    # to put the new jailing into affect.
+    my $jailfh = open_file_with_lock $jail_file, O_WRONLY|O_CREAT|O_TRUNC, LOCK_EX;
     while (my (undef, $v) = each %inmates) {
-        Log 'print $jailfh '.$v if $debug;
-        print $fh "$v\n" or Die "write failed ($jail_file): $!";
+        Log "print $jailfh $v" if $debug;
+        print $jailfh "$v\n" or Die "write failed ($jail_file): $!";
     }
     while (my (undef, $v) = each %peer_inmates) {
-        Log 'print $jailfh '.$v if $debug;
-        print $fh "$v\n" or Die "write failed ($jail_file): $!";
+        Log "print $jailfh $v" if $debug;
+        print $jailfh "$v\n" or Die "write failed ($jail_file): $!";
     }
     while (my (undef, $v) = each %new_inmates) {
-        Log 'print $jailfh '.$v if $debug;
-        print $fh "$v\n" or Die "write failed ($jail_file): $!";
+        Log "print $jailfh $v" if $debug;
+        print $jailfh "$v\n" or Die "write failed ($jail_file): $!";
     }
-    close $fh or Die "close failed ($jail_file): $!";
+    close $jailfh or Die "close failed ($jail_file): $!";
 }
 
 
 sub spawn {
     my $cmd = shift;
     my $ret = system($cmd);
-    Log "$cmd: returned nonzero value ($ret): $!" unless $ret == 0;
+    Log "$cmd: returned nonzero value ($ret): $!" if $ret != 0;
 }
 
 
 sub notify_admins {
+    # Send the Postcop adminstrators notifications of new jailings.
     my $smtp;
     unless ($smtp = Net::SMTP->new($mailhost) ) {
         Log "smtp new failed ($mailhost): $!";
