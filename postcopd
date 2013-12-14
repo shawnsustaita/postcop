@@ -41,7 +41,7 @@ my $listen_address       = '192.168.0.6';
 my @peers                = ();
 my $mydomain             = 'localhost';
 my $mailhost             = $mydomain;
-my $postcop             = "postcop\@$mydomain";
+my $postcop              = "postcop\@$mydomain";
 my @admins               = ( "root\@$mydomain" );
 my $max_peer_connections = 2;
 
