@@ -89,7 +89,6 @@ sub process_jail_sentences;
 sub spawn;
 sub notify_admins;
 sub Die;
-sub terminate_process_group;
 
 
 ### MAIN
@@ -132,7 +131,7 @@ sub main {
     }
     Log "Postcop finished.";
     unlink $pid_file;
-    terminate_process_group;
+    kill -15, getpgrp;  # sig TERM to process group.
     exit 0;
 }
 
@@ -249,7 +248,7 @@ sub tcp_network_server {
     close $listener or Die "close failed (listener): $!";
 
     unlink $pid_file;
-    terminate_process_group;
+    kill -15, getpgrp;  # sig TERM to process group.
 
     exit 0;
 }
@@ -294,7 +293,7 @@ sub service_peer {
     close $peer   or Die "close failed (child peer): $!";
 
     unlink $pid_file;
-    terminate_process_group;
+    kill -15, getpgrp;  # sig TERM to process group.
 
     exit 0;
 }
@@ -670,13 +669,8 @@ sub Die {
     my $msg = shift;
     Log $msg;
     Log "postcop died unexpectedly";
-    terminate_process_group;
-    exit 1;
-}
-
-
-sub terminate_process_group {
     kill -15, getpgrp;  # sig TERM to process group.
+    exit 1;
 }
 
 
