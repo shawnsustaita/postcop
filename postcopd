@@ -18,7 +18,7 @@ use List::MoreUtils   qw/any none/;
 
 ### CONFIGURATION FILE GLOBALS
 my $debug                = 0;
-my $foreground           = 1;
+my $foreground           = 0;
 my $alarm_time           = 5;
 my $jail_time            = 15;
 my $send_threshold       = 3;
@@ -70,13 +70,13 @@ sub init_signals;
 sub init_syslog;
 sub daemonize;
 sub create_locked_pid_file;
+sub open_file_with_lock;
 sub service_peer;
 sub tcp_network_server;
 sub init_maillog;
 sub Log;
 sub tie_vars;
 sub untie_vars;
-sub open_file_with_lock;
 sub is_pardoned;
 sub is_inmate;
 sub is_peer_inmate;
@@ -89,7 +89,7 @@ sub process_jail_sentences;
 sub spawn;
 sub notify_admins;
 sub Die;
-sub cleanup;
+sub terminate_process_group;
 
 
 ### MAIN
@@ -100,10 +100,11 @@ main;
 sub main {
     $0 = 'postcopd';   # Set appropriate program name.
     init_signals;
-    $| = 1             if  $foreground;  # Autoflush if $foreground.
-    init_syslog        if !$foreground;
-    daemonize          if !$foreground;
-    tcp_network_server if  @peers;
+    $| = 1                 if  $foreground;  # Autoflush if $foreground.
+    init_syslog            if !$foreground;
+    daemonize              if !$foreground;
+    create_locked_pid_file;  # To ensure only one postcopd runs.
+    tcp_network_server     if  @peers;
     init_maillog;
     Log "Postcop started.";
     Log "Threshold rate set to $send_threshold emails per $alarm_time seconds.";
@@ -130,7 +131,8 @@ sub main {
         untie_vars;
     }
     Log "Postcop finished.";
-    cleanup;
+    unlink $pid_file;
+    terminate_process_group;
     exit 0;
 }
 
@@ -174,9 +176,6 @@ sub daemonize {
     open STDOUT, '>', '/dev/null' or Die "open STDOUT failed (/dev/null): $!";
     open STDERR, '>', '/dev/null' or Die "open STDERR failed (/dev/null): $!";
 
-    # Ensure only a single daemon via locked pid file.
-    create_locked_pid_file;
-
     return;
 }
 
@@ -208,10 +207,8 @@ sub tcp_network_server {
     # child...
 
     # Adjust signals accordingly.
-    $SIG{ALRM} = 'IGNORE';
-
-    # For parent only.
-    close $pid_fh or Die "close failed ($pid_file): $!";
+    $SIG{ALRM} = $SIG{HUP} = 'IGNORE';
+    $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
 
     # Create tcp network server.
     $listener = IO::Socket::INET->new(LocalAddr => $listen_address,
@@ -249,8 +246,11 @@ sub tcp_network_server {
         # Reap zombies and adjust peer connection count accordingly.
         $peer_connections-- while (waitpid(-1, WNOHANG) > 0);
     }
+    close $listener or Die "close failed (listener): $!";
 
-    cleanup;
+    unlink $pid_file;
+    terminate_process_group;
+
     exit 0;
 }
 
@@ -273,7 +273,8 @@ sub service_peer {
     close $listener or Die "close failed (listener): $!";
 
     # Adjust signals accordingly.
-    $SIG{ALRM} = $SIG{PIPE} = 'IGNORE';
+    $SIG{ALRM} = $SIG{HUP} = $SIG{PIPE} = 'IGNORE';
+    $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
 
     # Only service recognized peers.
     if (none { $peer->peerhost eq $_ } @peers) {
@@ -291,6 +292,9 @@ sub service_peer {
     }
     close $jailfh or Die "close failed ($jail_file): $!";
     close $peer   or Die "close failed (child peer): $!";
+
+    unlink $pid_file;
+    terminate_process_group;
 
     exit 0;
 }
@@ -666,14 +670,13 @@ sub Die {
     my $msg = shift;
     Log $msg;
     Log "postcop died unexpectedly";
-    cleanup;
+    terminate_process_group;
     exit 1;
 }
 
 
-sub cleanup {
+sub terminate_process_group {
     kill -15, getpgrp;  # sig TERM to process group.
-    unlink $pid_file;
 }
 
 
