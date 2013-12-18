@@ -6,22 +6,23 @@ use strict;
 use warnings;
 use IO::File;
 use File::stat;
-use Sys::Syslog       qw/setlogsock openlog syslog/;
-use Fcntl             qw/:DEFAULT :flock/;
-use POSIX             qw/setsid sysconf _SC_OPEN_MAX WNOHANG/;
+use Sys::Syslog           qw/setlogsock openlog syslog/;
+use Fcntl                 qw/:DEFAULT :flock/;
+use POSIX                 qw/setsid sysconf _SC_OPEN_MAX WNOHANG/;
 use IO::Socket::INET;
-use Net::SMTP;
+use Email::Sender::Simple qw/try_to_sendmail/;
 use Linux::Inotify2;
 use DBM::Deep;
-use List::MoreUtils   qw/any none/;
+use List::MoreUtils       qw/any none/;
 
 
 ### CONFIGURATION FILE GLOBALS
 my $debug                = 0;
-my $foreground           = 0;
+my $foreground           = 1;
 my $alarm_time           = 5;
 my $jail_time            = 15;
 my $send_threshold       = 3;
+my $max_peer_connections = 2;
 my $syslog_facility      = 'local0';
 my $syslog_priority      = 'warning';
 my $syslog_socktype      = 'unix';
@@ -39,11 +40,12 @@ my @scripts              = ();
 my $listen_port          = 666;
 my $listen_address       = '192.168.0.6';
 my @peers                = ();
-my $mydomain             = 'localhost';
-my $mailhost             = $mydomain;
-my $postcop              = "postcop\@$mydomain";
-my @admins               = ( "root\@$mydomain" );
-my $max_peer_connections = 2;
+my $from                 = 'postcop@localhost';
+my $to                   = 'root@localhost';
+my $subject              = 'Postcop Jailings';
+my $header               = [ To      => $to,
+                             From    => $from,
+                             Subject => $subject ];
 
 
 ### NON-CONFIGURATION FILE GLOBALS (INTERNALS)
@@ -126,7 +128,7 @@ sub main {
 #                 spawn "$script $inmate";
 #             }
 #        }
-#        notify_admins if %new_inmates;
+        notify_admins if %new_inmates;
         untie_vars;
     }
     Log "Postcop finished.";
@@ -444,8 +446,8 @@ sub process_maillogs {
 
 
 sub process_pardons {
-    # Postcop is above the law; Pardon $postcop.
-    $pardons{$postcop} = '';  # XXX can I leave value undef?
+    # Postcop is above the law; Pardon $from.
+    $pardons{$from} = '';  # XXX can I leave value undef?
 
     # Iterate pardons.
     # Parse the pardon file.  File consists of line separated regexps.
@@ -636,32 +638,17 @@ sub spawn {
 
 
 sub notify_admins {
-    # Send the Postcop adminstrators notifications of new jailings.
-    my $smtp;
-    unless ($smtp = Net::SMTP->new($mailhost) ) {
-        Log "smtp new failed ($mailhost): $!";
-        return;
-    }
-    unless ($smtp->mail($postcop)) {
-        Log "smtp sender failed ($postcop): $!";
-        return;
-    }
-    unless ($smtp->recipient(@admins, { Notify => ['NEVER'], SkipBad => 1 })) {
-        Log 'smtp recipient failed ('.join(',', @admins)."): $!";
-        return;
-    }
-    my $msg = "Subject: Postcop Jail Sentences\n\n";
+    # Build body; Newline separated list of new jailings.
+    my $body;
     while (my ($k, undef) = each %new_inmates) {
-        $msg .= "$k\n";
+        $body .= "$k\n";
     }
-    unless ($smtp->data($msg)) {
-        Log "smtp data failed ($msg): $!";
-        return;
-    }
-    unless ($smtp->quit) {
-        Log "smtp quit failed: $!";
-        return;
-    }
+
+    # Build email.
+    my $email = Email::Simple->create(header => $header, body => $body);
+
+    # Best effort attempt to send new jailings to admin address.
+    try_to_sendmail($email) or Log "sendmail failed: $!";
 }
 
 
