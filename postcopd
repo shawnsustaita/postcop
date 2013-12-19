@@ -22,7 +22,6 @@ my $foreground           = 1;
 my $alarm_time           = 5;
 my $jail_time            = 15;
 my $send_threshold       = 3;
-my $max_peer_connections = 2;
 my $syslog_facility      = 'local0';
 my $syslog_priority      = 'warning';
 my $syslog_socktype      = 'unix';
@@ -32,10 +31,9 @@ my $pardon_file          = '/usr/local/etc/postcop/pardon';
 my $jail_file            = '/usr/local/etc/postcop/jail';
 my $pid_file             = '/var/run/postcopd.pid';
 my $maillog_regexp       = qr{postfix/qmgr\[\d+\]: (\w+): from=<(.*?)>, size=\d+, nrcpt=(\d+) \(queue active\)}io;
-my $action               = 'DISCARD';
-my $action_text          = "$action additional text here";
-my $inmate_msg           = "Email limit exceeded.";
-my $postmap              = "/usr/sbin/postmap $jail_file";
+my $postfix_access       = "HOLD additional text here";
+my $violation_msg        = "Email limit exceeded.";
+my $postmap_cmd          = "/usr/sbin/postmap $jail_file";
 my @scripts              = ();
 my $listen_port          = 666;
 my $listen_address       = '192.168.0.6';
@@ -43,9 +41,6 @@ my @peers                = ();
 my $from                 = 'postcop@localhost';
 my $to                   = 'root@localhost';
 my $subject              = 'Postcop Jailings';
-my $header               = [ To      => $to,
-                             From    => $from,
-                             Subject => $subject ];
 
 
 ### NON-CONFIGURATION FILE GLOBALS (INTERNALS)
@@ -53,6 +48,7 @@ my $done                 =  0;
 my $alarm                =  0;
 my $maillog_rotated      =  0;
 my $maillog_inode        = -1;
+my $max_peer_connections =  2;
 my $pid_fh;
 my $maillog_fh;
 my $inotify;
@@ -64,6 +60,9 @@ my %pardons;
 my %inmates;
 my %new_inmates;
 my %peer_inmates;
+my $header               =  [ To      => $to,
+                              From    => $from,
+                              Subject => $subject ];
 
 
 ### DECLARATIONS
@@ -104,7 +103,7 @@ sub main {
     $| = 1                 if  $foreground;  # Autoflush if $foreground.
     init_syslog            if !$foreground;
     daemonize              if !$foreground;
-    create_locked_pid_file;  # To ensure only one postcopd runs.
+    create_locked_pid_file;    # To ensure only one running postcopd.
     tcp_network_server     if  @peers;
     init_maillog;
     Log "Postcop started.";
@@ -118,7 +117,7 @@ sub main {
         process_peer_inmates;
         process_new_inmates;
         process_jail_sentences;
-        spawn $postmap;
+        spawn $postmap_cmd;
 #        for my $script (@scripts) {
 #             my $inmate;
 #             while (($inmate, undef) = each %new_inmates) {
@@ -484,7 +483,7 @@ sub process_inmates {
         chomp $line;
 
         # Match a valid jail entry or ignore it verbosely.
-        if ($line !~ /^(.*) $action_text \[([0-9]+)\]$/) {
+        if ($line !~ /^(.*) $postfix_access \[([0-9]+)\]$/) {
             Log "ignoring malformed jail entry or jail policy mis-match: $line";
             next;
         }
@@ -543,8 +542,8 @@ sub process_peer_inmates {
             # Remove newline.
             chomp $line;
 
-            # Jail policies (ie $action_text) must be identical for inmate transfers.
-            if ($line !~ /^(.*) $action_text \[([0-9]+)\]$/) {
+            # Jail policies (ie $postfix_access) must be identical for inmate transfers.
+            if ($line !~ /^(.*) $postfix_access \[([0-9]+)\]$/) {
                 Log "ignoring malformed jail entry or jail policy mis-match: $line";
                 next JAILINGS;
             }
@@ -565,8 +564,8 @@ sub process_peer_inmates {
 
             # Populate data structures for later processing.
             Log "$sender has been sentenced jail time via peer collaboration ($peer)";
-            Log "\$peer_inmates{$sender} = $sender $action_text [$now]" if $debug;
-            $peer_inmates{$sender} = "$sender $action_text [$now]";
+            Log "\$peer_inmates{$sender} = $sender $postfix_access [$now]" if $debug;
+            $peer_inmates{$sender} = "$sender $postfix_access [$now]";
         }  # end JAILINGS
         close $sock;
     }  # end PEERS
@@ -602,8 +601,8 @@ sub process_new_inmates {
         }
 
         # Populate data structures for later processing.
-        Log "\$new_inmates{$sender} = $sender $action_text [$now]" if $debug;
-        $new_inmates{$sender} = "$sender $action_text [$now]";
+        Log "\$new_inmates{$sender} = $sender $postfix_access [$now]" if $debug;
+        $new_inmates{$sender} = "$sender $postfix_access [$now]";
     }
 }
 
