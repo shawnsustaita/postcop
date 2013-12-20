@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 
 
 ### MODULES
@@ -34,7 +34,6 @@ my $maillog_regexp       = qr{postfix/qmgr\[\d+\]: (\w+): from=<(.*?)>, size=\d+
 my $postfix_access       = "HOLD additional text here";
 my $violation_msg        = "Email limit exceeded.";
 my $postmap_cmd          = "/usr/sbin/postmap $jail_file";
-my @scripts              = ();
 my $listen_port          = 666;
 my $listen_address       = '192.168.0.6';
 my @peers                = ();
@@ -118,15 +117,6 @@ sub main {
         process_new_inmates;
         process_jail_sentences;
         spawn $postmap_cmd;
-#        for my $script (@scripts) {
-#             my $inmate;
-#             while (($inmate, undef) = each %new_inmates) {
-#                 spawn "$script $inmate";
-#             }
-#             while (($inmate, undef) = each %peer_inmates) {
-#                 spawn "$script $inmate";
-#             }
-#        }
         notify_admins if %new_inmates;
         untie_vars;
     }
@@ -471,6 +461,7 @@ sub process_pardons {
     return;
 }
 
+
 sub process_inmates {
     # Time now is for calculating current jail durations.
     my $now = time;
@@ -567,8 +558,11 @@ sub process_peer_inmates {
             Log "\$peer_inmates{$sender} = $sender $postfix_access [$now]" if $debug;
             $peer_inmates{$sender} = "$sender $postfix_access [$now]";
         }  # end JAILINGS
+
         close $sock;
+
     }  # end PEERS
+
     return;
 }
 
