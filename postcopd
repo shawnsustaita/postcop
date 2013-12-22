@@ -30,7 +30,6 @@ my $tmpworkdir           = '/var/lib/postcop/';
 my $pardon_file          = '/usr/local/etc/postcop/pardon';
 my $jail_file            = '/usr/local/etc/postcop/jail';
 my $pid_file             = '/var/run/postcopd.pid';
-my $maillog_regexp       = qr{postfix/qmgr\[\d+\]: (\w+): from=<(.*?)>, size=\d+, nrcpt=(\d+) \(queue active\)}io;
 my $postfix_access       = "HOLD additional text here";
 my $violation_msg        = "Email limit exceeded.";
 my $postmap_cmd          = "/usr/sbin/postmap $jail_file";
@@ -40,6 +39,16 @@ my @peers                = ();
 my $from                 = 'postcop@localhost';
 my $to                   = 'root@localhost';
 my $subject              = 'Postcop Jailings';
+my $maillog_regexp       = qr{
+                                 \s             # Whitespace
+                                 (.*?):         # Capture mail ID
+                                 \s             # Whitespace
+                                 from=<(.*?)>,  # Capture sender email address
+                                 \s             # Whitespace
+                                 size=.*?,      # Mail size (don't care)
+                                 \s             # Whitespace
+                                 nrcpt=(\d+)    # Capture number of recipients
+                             }xmsio;
 
 
 ### NON-CONFIGURATION FILE GLOBALS (INTERNALS)
