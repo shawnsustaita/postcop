@@ -17,22 +17,22 @@ use List::MoreUtils       qw/any none/;
 
 
 ### CONFIGURATION FILE GLOBALS
-my $debug                = 0;
+my $debug                = 1;
 my $foreground           = 1;
-my $alarm_time           = 5;
-my $jail_time            = 15;
+my $alarm_time           = 10;
+my $jail_time            = 30;
 my $send_threshold       = 3;
 my $syslog_facility      = 'local0';
 my $syslog_priority      = 'warning';
 my $syslog_socktype      = 'unix';
 my $maillog_file         = '/var/log/mail.log';
 my $tmpworkdir           = '/var/lib/postcop/';
-my $pardon_file          = '/usr/local/etc/postcop/pardon';
-my $jail_file            = '/usr/local/etc/postcop/jail';
+my $pardon_file          = '/etc/postfix/postcop_pardons';
+my $jail_file            = '/etc/postfix/postcop_jailings';
 my $pid_file             = '/var/run/postcopd.pid';
-my $postfix_access       = "HOLD additional text here";
-my $violation_msg        = "Email limit exceeded.";
-my $postmap_cmd          = "/usr/sbin/postmap $jail_file";
+my $postfix_access       = 'DISCARD Email rate limit exceeded.';  # HOLD or DISCARD
+my $postmap_cmd          = '/usr/sbin/postmap';
+my $postsuper_cmd        = '/usr/sbin/postsuper';
 my $listen_port          = 666;
 my $listen_address       = '192.168.0.6';
 my @peers                = ();
@@ -40,6 +40,8 @@ my $from                 = 'postcop@localhost';
 my $to                   = 'root@localhost';
 my $subject              = 'Postcop Jailings';
 my $maillog_regexp       = qr{
+                                 \A             # Anchor to beginning of srtring
+                                 .*             # Match anything (including newline)
                                  \s             # Whitespace
                                  (.*?):         # Capture mail ID
                                  \s             # Whitespace
@@ -48,6 +50,8 @@ my $maillog_regexp       = qr{
                                  size=.*?,      # Mail size (don't care)
                                  \s             # Whitespace
                                  nrcpt=(\d+)    # Capture number of recipients
+                                 .*             # Match anything (including newline)
+                                 \z             # Anchor to end of string
                              }xmsio;
 
 
@@ -95,7 +99,8 @@ sub process_inmates;
 sub process_peer_inmates;
 sub process_new_inmates;
 sub process_jail_sentences;
-sub spawn;
+sub postmap;
+sub postsuper;
 sub notify_admins;
 sub Die;
 
@@ -106,13 +111,13 @@ main;
 
 ### SUBROUTINES
 sub main {
-    $0 = 'postcopd';   # Set appropriate program name.
+    $0 = 'postcopd';
     init_signals;
-    $| = 1                 if  $foreground;  # Autoflush if $foreground.
-    init_syslog            if !$foreground;
-    daemonize              if !$foreground;
-    create_locked_pid_file;    # To ensure only one running postcopd.
-    tcp_network_server     if  @peers;
+    $| = 1                       if  $foreground;  # Autoflush
+    init_syslog                  if !$foreground;
+    daemonize                    if !$foreground;
+    create_locked_pid_file;
+    tcp_network_server           if  @peers;
     init_maillog;
     Log "Postcop started.";
     Log "Threshold rate set to $send_threshold emails per $alarm_time seconds.";
@@ -125,8 +130,9 @@ sub main {
         process_peer_inmates;
         process_new_inmates;
         process_jail_sentences;
-        spawn $postmap_cmd;
-        notify_admins if %new_inmates;
+        postmap                  if %new_inmates or %peer_inmates;
+        postsuper                if %new_inmates;
+        notify_admins            if %new_inmates;
         untie_vars;
     }
     Log "Postcop finished.";
@@ -462,7 +468,7 @@ sub process_pardons {
         }
 
         # Populate data structures for later processing.
-        Log "$pardons{$line} = ''" if $debug;
+        Log "\$pardons{$line} = ''" if $debug;
         $pardons{$line} = '';
     }
     close $pardonfh or Die "close failed ($pardon_file)";
@@ -510,7 +516,7 @@ sub process_inmates {
         }
 
         # Populate data structures for later processing.
-        Log "$inmates{$sender} = $line" if $debug;
+        Log "\$inmates{$sender} = $line" if $debug;
         $inmates{$sender} = $line;
     }
     close $jailfh or Die "close failed ($jail_file): $!";
@@ -607,6 +613,8 @@ sub process_new_inmates {
         Log "\$new_inmates{$sender} = $sender $postfix_access [$now]" if $debug;
         $new_inmates{$sender} = "$sender $postfix_access [$now]";
     }
+
+    return;
 }
 
 
@@ -617,25 +625,64 @@ sub process_jail_sentences {
     # to put the new jailing into affect.
     my $jailfh = open_file_with_lock $jail_file, O_WRONLY|O_CREAT|O_TRUNC, LOCK_EX;
     while (my (undef, $v) = each %inmates) {
-        Log "print $jailfh $v" if $debug;
+        Log "print \$jailfh $v" if $debug;
         print $jailfh "$v\n" or Die "write failed ($jail_file): $!";
     }
     while (my (undef, $v) = each %peer_inmates) {
-        Log "print $jailfh $v" if $debug;
+        Log "print \$jailfh $v" if $debug;
         print $jailfh "$v\n" or Die "write failed ($jail_file): $!";
     }
     while (my (undef, $v) = each %new_inmates) {
-        Log "print $jailfh $v" if $debug;
+        Log "print \$jailfh $v" if $debug;
         print $jailfh "$v\n" or Die "write failed ($jail_file): $!";
     }
     close $jailfh or Die "close failed ($jail_file): $!";
+
+    return;
 }
 
 
-sub spawn {
-    my $cmd = shift;
-    my $ret = system($cmd);
-    Log "$cmd: returned nonzero value ($ret): $!" if $ret != 0;
+sub postmap {
+    # Implement new jailings via Postfix' postmap command.
+    my $ret = system($postmap_cmd, $jail_file);
+    Die "system failed ($postmap_cmd $jail_file): returned $ret: $!"
+        if $ret != 0;
+    return;
+}
+
+
+sub postsuper {
+    # Hold/Discard queued mail of new inmates.
+    my $pipefh;
+    my $postsuper_opt;
+
+    # Determine action (hold or discard).
+    if ($postfix_access =~ /\A hold \s .* \z /xmsi) {
+        $postsuper_opt = '-h-';
+    }
+    elsif ($postfix_access =~ /\A discard \s .* \z /xmsi) {
+        $postsuper_opt = '-d-';
+    }
+    else {
+        Die "Invalid postfix_access ($postfix_access)";
+    }
+
+    # Open pipe to Postfix' postsuper command.
+    open $pipefh, '|-', $postsuper_cmd, $postsuper_opt
+        or Die "open pipe failed ($postsuper_cmd $postsuper_opt): $!";
+
+    # Hold or Discard queued mail for new inmates.
+    while (my ($new_inmate, undef) = each %new_inmates) {
+        my $mail_ids_aref = $sender_mail_ids{$new_inmate};
+        for my $mail_id (@{ $mail_ids_aref }) {
+            # Write mail ID to postsuper's stdin via pipe.
+            print $pipefh "$mail_id\n";
+        }
+    }
+
+    close $pipefh or Die "close failed (pipefh): $!";
+
+    return;
 }
 
 
@@ -651,6 +698,8 @@ sub notify_admins {
 
     # Best effort attempt to send new jailings to admin address.
     try_to_sendmail($email) or Log "try_to_sendmail failed: $!";
+
+    return;
 }
 
 
