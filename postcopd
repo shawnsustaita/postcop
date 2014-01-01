@@ -19,26 +19,39 @@ use List::MoreUtils       qw/any none/;
 ### CONFIGURATION FILE GLOBALS
 my $debug                = 1;
 my $foreground           = 1;
-my $alarm_time           = 10;
-my $jail_time            = 30;
-my $send_threshold       = 3;
+my $alarm_time           = 5;
+my $jail_time            = 15;
+my $send_threshold       = 1;
 my $syslog_facility      = 'local0';
 my $syslog_priority      = 'warning';
 my $syslog_socktype      = 'unix';
 my $maillog_file         = '/var/log/mail.log';
-my $tmpworkdir           = '/var/lib/postcop/';
+my $tmpworkdir           = '/var/lib/postcop';
 my $pardon_file          = '/etc/postfix/postcop_pardons';
 my $jail_file            = '/etc/postfix/postcop_jailings';
 my $pid_file             = '/var/run/postcopd.pid';
-my $postfix_access       = 'DISCARD Email rate limit exceeded.';  # HOLD or DISCARD
-my $postmap_cmd          = '/usr/sbin/postmap';
-my $postsuper_cmd        = '/usr/sbin/postsuper';
+my $postfix_access       = 'DISCARD Email rate limit exceeded.';
+my $postmap_cmd          = "/usr/sbin/postmap $jail_file";
+my $postsuper_cmd        = '/usr/sbin/postsuper -d-';  # Must read stdin!
 my $listen_port          = 666;
 my $listen_address       = '192.168.0.6';
 my @peers                = ();
 my $from                 = 'postcop@localhost';
 my $to                   = 'root@localhost';
 my $subject              = 'Postcop Jailings';
+
+# Regexp that parses Postfix postmap file.
+my $jailing_regexp       = qr{   \A             # Anchor to beginning of srtring
+                                 ([^\s]+)       # Capture inmate (ie sender addr)
+                                 [\s]+          # Whitespace
+                                 .*             # Match anything ($postfix_access)
+                                 [\s]           # Whitespace
+                                 \[([0-9]+)\]   # Capture jail time seconds
+                                 \s*            # Whitespace
+                                 \z             # Anchor to end of string
+                             }xmsio;
+
+# Regexp that parses Postfix mail logs.
 my $maillog_regexp       = qr{
                                  \A             # Anchor to beginning of srtring
                                  .*             # Match anything (including newline)
@@ -79,6 +92,8 @@ my $header               =  [ To      => $to,
 
 ### DECLARATIONS
 sub main;
+sub initialize;
+sub finalize;
 sub init_signals;
 sub init_syslog;
 sub daemonize;
@@ -88,8 +103,8 @@ sub service_peer;
 sub tcp_network_server;
 sub init_maillog;
 sub Log;
-sub tie_vars;
-sub untie_vars;
+sub tie_db_vars;
+sub init_db_vars;
 sub is_pardoned;
 sub is_inmate;
 sub is_peer_inmate;
@@ -111,34 +126,47 @@ main;
 
 ### SUBROUTINES
 sub main {
-    $0 = 'postcopd';
-    init_signals;
-    $| = 1                       if  $foreground;  # Autoflush
-    init_syslog                  if !$foreground;
-    daemonize                    if !$foreground;
-    create_locked_pid_file;
-    tcp_network_server           if  @peers;
-    init_maillog;
-    Log "Postcop started.";
-    Log "Threshold rate set to $send_threshold emails per $alarm_time seconds.";
-    Log "Mail log processing is set to $alarm_time second intervals.";
+    initialize;
     while ( !$done ) {
-        tie_vars;
+        init_db_vars;
         process_maillogs;
         process_pardons;
         process_inmates;
         process_peer_inmates;
         process_new_inmates;
         process_jail_sentences;
-        postmap                  if %new_inmates or %peer_inmates;
-        postsuper                if %new_inmates;
-        notify_admins            if %new_inmates;
-        untie_vars;
+        postmap;
+        postsuper;
+        notify_admins;
     }
-    Log "Postcop finished.";
-    unlink $pid_file;
-    kill -15, getpgrp;  # sig TERM to process group.
+    finalize;
     exit 0;
+}
+
+
+sub initialize {
+    $0 = 'postcopd';
+    init_signals;
+    $| = 1      if  $foreground;  # Autoflush
+    init_syslog if !$foreground;
+    daemonize   if !$foreground;
+    create_locked_pid_file;
+    tcp_network_server;
+    init_maillog;
+    tie_db_vars;
+    Log "Postcop started.";
+    Log "Threshold rate set to $send_threshold emails per $alarm_time seconds.";
+    Log "Mail log processing is set to $alarm_time second intervals.";
+    return;
+}
+
+
+sub finalize {
+    Log "Postcop finished.";
+    unlink glob "$tmpworkdir/*.db";
+    unlink $pid_file;
+    kill -15, getpgrp;  # sig TERM process group.
+    return;
 }
 
 
@@ -205,6 +233,9 @@ sub open_file_with_lock {
 
 
 sub tcp_network_server {
+    # Simply return if no peers to collaborate with.
+    return if !@peers;
+
     # Spawn child network server.
     my $pid = fork;
     $pid < 0 and Die "fork failed (tcp_network_server): $!";
@@ -239,8 +270,8 @@ sub tcp_network_server {
         # Don't exceed max number of peer connections.
         $peer_connections++;
         if ($peer_connections > $max_peer_connections) {
-            Log "maximum peer connections reached ($max_peer_connections)";
-            Log "ignoring connection ($peer->peerhost)";
+            Log "maximum peer connections reached ($max_peer_connections).";
+            Log "Ignoring connection ($peer->peerhost).";
             $peer_connections--;
             next;
         }
@@ -253,7 +284,6 @@ sub tcp_network_server {
     }
     close $listener or Die "close failed (listener): $!";
 
-    unlink $pid_file;
     kill -15, getpgrp;  # sig TERM to process group.
 
     exit 0;
@@ -283,12 +313,12 @@ sub service_peer {
 
     # Only service recognized peers.
     if (none { $peer->peerhost eq $_ } @peers) {
-        Log "unrecognized peer connection ($peer->peerhost)";
+        Log "Unrecognized peer connection ($peer->peerhost).";
         close $peer or Die "close failed (unrecognized peer $peer->peerhost): $!";
         exit 0;
     }
 
-    Log "sharing jailings with peer ($peer->peerhost)";
+    Log "Sharing jailings with peer ($peer->peerhost).";
 
     # Share your jailings with peer.
     my $jailfh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
@@ -298,7 +328,6 @@ sub service_peer {
     close $jailfh or Die "close failed ($jail_file): $!";
     close $peer   or Die "close failed (child peer): $!";
 
-    unlink $pid_file;
     kill -15, getpgrp;  # sig TERM to process group.
 
     exit 0;
@@ -333,11 +362,14 @@ sub init_maillog {
     else {
         $maillog_fh->seek(0, SEEK_END) or Die "seek failed ($maillog_file): $!";
     }
+
+    return;
 }
 
 
 sub Log {
     my $log = shift;
+
     if ($foreground) {
         print '['.scalar(localtime(time)).'] '."$log\n";
         STDOUT->flush;
@@ -345,11 +377,13 @@ sub Log {
     else {
         syslog $syslog_priority, $log;
     }
+
+    return;
 }
 
 
-# Hashes are tied to files for the purpose of avoiding memory exhaustion.
-sub tie_vars {
+sub tie_db_vars {
+    # Hashes are tied to files for the purpose of avoiding memory exhaustion.
     tie %sender_mail_counts, 'DBM::Deep', $tmpworkdir.'/sender_mail_counts.db'
         or Die "Tie failed (sender_mail_counts): $!";
     tie %sender_mail_ids, 'DBM::Deep', $tmpworkdir.'/sender_mail_ids.db'
@@ -364,17 +398,19 @@ sub tie_vars {
         or Die "Tie failed (peer_inmates): $!";
     tie %pardons, 'DBM::Deep', $tmpworkdir.'/pardons.db'
         or Die "Tie failed (pardons): $!";
+    return;
 }
 
 
-sub untie_vars {
-    untie(%sender_mail_counts = ());
-    untie(%sender_mail_ids = ());
-    untie(%sender_mail_logs = ());
-    untie(%inmates = ());
-    untie(%new_inmates = ());
-    untie(%peer_inmates = ());
-    untie(%pardons = ());
+sub init_db_vars {
+    %sender_mail_counts = ();
+    %sender_mail_ids    = ();
+    %sender_mail_logs   = ();
+    %inmates            = ();
+    %new_inmates        = ();
+    %peer_inmates       = ();
+    %pardons            = ();
+    return;
 }
 
 
@@ -396,7 +432,7 @@ sub process_maillogs {
                 $maillog_rotated = 1;
             }
 
-            Log "maillog rotated" if $debug and $maillog_rotated;
+            Log "Maillog rotated." if $debug and $maillog_rotated;
 
             # if EOF and log rotated, open new log.
             if ($maillog_rotated) {
@@ -451,12 +487,12 @@ sub process_maillogs {
 
 sub process_pardons {
     # Postcop is above the law; Pardon $from.
-    $pardons{$from} = '';  # XXX can I leave value undef?
+    $pardons{$from} = '1';  # Appease compiler with assignment.
 
     # Iterate pardons.
     # Parse the pardon file.  File consists of line separated regexps.
     my $pardonfh = open_file_with_lock $pardon_file, O_RDONLY|O_CREAT, LOCK_SH;
-    while (my $line = <$pardonfh>) {  # verify good regexes XXX (ie eval qr/.../)
+    while (my $line = <$pardonfh>) {
         # Remove newline.
         chomp $line;
 
@@ -468,8 +504,8 @@ sub process_pardons {
         }
 
         # Populate data structures for later processing.
-        Log "\$pardons{$line} = ''" if $debug;
-        $pardons{$line} = '';
+        Log "\$pardons{$line}" if $debug;
+        $pardons{$line} = '1';  # Appease compiler with assignment.
     }
     close $pardonfh or Die "close failed ($pardon_file)";
 
@@ -489,8 +525,8 @@ sub process_inmates {
         chomp $line;
 
         # Match a valid jail entry or ignore it verbosely.
-        if ($line !~ /^(.*) $postfix_access \[([0-9]+)\]$/) {
-            Log "ignoring malformed jail entry or jail policy mis-match: $line";
+        if ($line !~ $jailing_regexp) {
+            Log "Ignoring malformed jail entry: $line";
             next;
         }
 
@@ -499,19 +535,19 @@ sub process_inmates {
 
         # Verify good data or ignore verbosely.
         if (!defined($sender) and !defined($then)) {
-            Log "ignoring malformed jail entry: $line";
+            Log "Ignoring malformed jail entry: $line";
             next;
         }
 
         # Free inmates that served their jail sentence.
         if ( ($now - $then) >= $jail_time ) {
-            Log "$sender has been freed from jail (sentence expired)";
+            Log "$sender has been freed from jail (sentence expired).";
             next;
         }
 
         # Free inmates that have been pardoned.
         if (is_pardoned($sender)) {
-            Log "$sender has been freed from jail (pardoned)";
+            Log "$sender has been freed from jail (pardoned).";
             next;
         }
 
@@ -549,8 +585,8 @@ sub process_peer_inmates {
             chomp $line;
 
             # Jail policies (ie $postfix_access) must be identical for inmate transfers.
-            if ($line !~ /^(.*) $postfix_access \[([0-9]+)\]$/) {
-                Log "ignoring malformed jail entry or jail policy mis-match: $line";
+            if ($line !~ $jailing_regexp) {
+                Log "Ignoring malformed jail entry: $line";
                 next JAILINGS;
             }
             
@@ -563,13 +599,12 @@ sub process_peer_inmates {
                 next JAILINGS;
             }
 
-            # Local jail policies take precedence.
-            # If peer inmate is already locally jailed or pardoned, ignore peer inmate.
+            # Ignore sender if already processed.
             next if is_pardoned($sender);
             next if is_inmate($sender);
 
             # Populate data structures for later processing.
-            Log "$sender has been sentenced jail time via peer collaboration ($peer)";
+            Log "$sender has been sentenced jail time via peer collaboration ($peer).";
             Log "\$peer_inmates{$sender} = $sender $postfix_access [$now]" if $debug;
             $peer_inmates{$sender} = "$sender $postfix_access [$now]";
         }  # end JAILINGS
@@ -601,10 +636,10 @@ sub process_new_inmates {
         next if is_inmate($sender);
         next if is_peer_inmate($sender);
 
-        Log "$sender has been sentenced jail time";
-        Log "$sender sent at a rate of $count emails per $alarm_time seconds";
+        Log "$sender has been jailed ($count emails per $alarm_time seconds).";
+
         if ($debug) {
-            for my $mail_log ( @{ $sender_mail_logs{$sender} } ) {
+            while (my (undef, $mail_log) = each @{ $sender_mail_logs{$sender} }) {
                 Log $mail_log;
             }
         }
@@ -620,22 +655,30 @@ sub process_new_inmates {
 
 sub process_jail_sentences {
     # Iterate through processed data structures and perform jailings.
-    # In other words, write the postfix access rules to the postmap'able
+    # In other words, write the postfix access rules to the postmapable
     # jail file.  The postmap command will later be executed on the jail file
     # to put the new jailing into affect.
+
     my $jailfh = open_file_with_lock $jail_file, O_WRONLY|O_CREAT|O_TRUNC, LOCK_EX;
-    while (my (undef, $v) = each %inmates) {
-        Log "print \$jailfh $v" if $debug;
-        print $jailfh "$v\n" or Die "write failed ($jail_file): $!";
+
+    # Jail existing inmates.
+    while (my (undef, $jailing) = each %inmates) {
+        Log "print \$jailfh $jailing" if $debug;
+        print $jailfh "$jailing\n" or Die "write failed ($jail_file): $!";
     }
-    while (my (undef, $v) = each %peer_inmates) {
-        Log "print \$jailfh $v" if $debug;
-        print $jailfh "$v\n" or Die "write failed ($jail_file): $!";
+
+    # Jail peer inmates.
+    while (my (undef, $jailing) = each %peer_inmates) {
+        Log "print \$jailfh $jailing" if $debug;
+        print $jailfh "$jailing\n" or Die "write failed ($jail_file): $!";
     }
-    while (my (undef, $v) = each %new_inmates) {
-        Log "print \$jailfh $v" if $debug;
-        print $jailfh "$v\n" or Die "write failed ($jail_file): $!";
+
+    # Jail new inmates.
+    while (my (undef, $jailing) = each %new_inmates) {
+        Log "print \$jailfh $jailing" if $debug;
+        print $jailfh "$jailing\n" or Die "write failed ($jail_file): $!";
     }
+
     close $jailfh or Die "close failed ($jail_file): $!";
 
     return;
@@ -644,37 +687,26 @@ sub process_jail_sentences {
 
 sub postmap {
     # Implement new jailings via Postfix' postmap command.
-    my $ret = system($postmap_cmd, $jail_file);
-    Die "system failed ($postmap_cmd $jail_file): returned $ret: $!"
+    my $ret = system($postmap_cmd);
+    Die "system failed ($postmap_cmd): returned $ret: $!"
         if $ret != 0;
     return;
 }
 
 
 sub postsuper {
-    # Hold/Discard queued mail of new inmates.
-    my $pipefh;
-    my $postsuper_opt;
-
-    # Determine action (hold or discard).
-    if ($postfix_access =~ /\A hold \s .* \z /xmsi) {
-        $postsuper_opt = '-h-';
-    }
-    elsif ($postfix_access =~ /\A discard \s .* \z /xmsi) {
-        $postsuper_opt = '-d-';
-    }
-    else {
-        Die "Invalid postfix_access ($postfix_access)";
-    }
+    # Return if nothing to do.
+    return if !%new_inmates;
 
     # Open pipe to Postfix' postsuper command.
-    open $pipefh, '|-', $postsuper_cmd, $postsuper_opt
-        or Die "open pipe failed ($postsuper_cmd $postsuper_opt): $!";
+    open my $pipefh, '|-', $postsuper_cmd
+        or Die "open pipe failed ($postsuper_cmd): $!";
 
-    # Hold or Discard queued mail for new inmates.
+    # Mail IDs will be written to postsuper via stdin.
     while (my ($new_inmate, undef) = each %new_inmates) {
         my $mail_ids_aref = $sender_mail_ids{$new_inmate};
-        for my $mail_id (@{ $mail_ids_aref }) {
+
+        while (my (undef, $mail_id) = each @{ $mail_ids_aref }) {
             # Write mail ID to postsuper's stdin via pipe.
             print $pipefh "$mail_id\n";
         }
@@ -687,16 +719,20 @@ sub postsuper {
 
 
 sub notify_admins {
+    # Return if nothing to do.
+    return if !%new_inmates;
+
     # Build body; Newline separated list of new jailings.
     my $body;
-    while (my ($k, undef) = each %new_inmates) {
-        $body .= "$k\n";
+    while (my ($new_inmate, undef) = each %new_inmates) {
+        $body .= "$new_inmate\n";
     }
 
     # Build email.
     my $email = Email::Simple->create(header => $header, body => $body);
 
     # Best effort attempt to send new jailings to admin address.
+    # Utilizes system sendmail command.
     try_to_sendmail($email) or Log "try_to_sendmail failed: $!";
 
     return;
@@ -706,15 +742,15 @@ sub notify_admins {
 sub Die {
     my $msg = shift;
     Log $msg;
-    Log "postcop died unexpectedly";
-    kill -15, getpgrp;  # sig TERM to process group.
+    Log "Postcop died unexpectedly.";
+    kill -15, getpgrp;  # Sig TERM process group.
     exit 1;
 }
 
 
 sub is_pardoned {
     my $sender = shift;
-    return defined $pardons{$sender};
+    return exists $pardons{$sender};
 }
 
 
