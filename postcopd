@@ -18,10 +18,10 @@ use List::MoreUtils       qw/any none/;
 
 ### CONFIGURATION FILE GLOBALS
 my $debug                = 1;
-my $foreground           = 1;
+my $foreground           = 0;
 my $alarm_time           = 5;
 my $jail_time            = 15;
-my $send_threshold       = 1;
+my $send_threshold       = 3;
 my $syslog_facility      = 'local0';
 my $syslog_priority      = 'warning';
 my $syslog_socktype      = 'unix';
@@ -35,37 +35,38 @@ my $postmap_cmd          = "/usr/sbin/postmap $jail_file";
 my $postsuper_cmd        = '/usr/sbin/postsuper -d-';  # Must read stdin!
 my $listen_port          = 666;
 my $listen_address       = '192.168.0.6';
-my @peers                = ();
+my @peers                = qw/192.168.0.6/;
 my $from                 = 'postcop@localhost';
 my $to                   = 'root@localhost';
 my $subject              = 'Postcop Jailings';
 
 # Regexp that parses Postfix postmap file.
-my $jailing_regexp       = qr{   \A             # Anchor to beginning of srtring
-                                 ([^\s]+)       # Capture inmate (ie sender addr)
-                                 [\s]+          # Whitespace
-                                 .*             # Match anything ($postfix_access)
-                                 [\s]           # Whitespace
-                                 \[([0-9]+)\]   # Capture jail time seconds
-                                 \s*            # Whitespace
-                                 \z             # Anchor to end of string
-                             }xmsio;
+my $jailing_regexp       = qr{
+    \A             # Anchor to beginning of srtring
+    ([^\s]+)       # Capture inmate (ie sender addr)
+    [\s]+          # Whitespace
+    .*             # Match anything ($postfix_access)
+    [\s]           # Whitespace
+    \[([0-9]+)\]   # Capture jail time seconds
+    \s*            # Whitespace
+    \z             # Anchor to end of string
+}xmsio;
 
 # Regexp that parses Postfix mail logs.
 my $maillog_regexp       = qr{
-                                 \A             # Anchor to beginning of srtring
-                                 .*             # Match anything (including newline)
-                                 \s             # Whitespace
-                                 (.*?):         # Capture mail ID
-                                 \s             # Whitespace
-                                 from=<(.*?)>,  # Capture sender email address
-                                 \s             # Whitespace
-                                 size=.*?,      # Mail size (don't care)
-                                 \s             # Whitespace
-                                 nrcpt=(\d+)    # Capture number of recipients
-                                 .*             # Match anything (including newline)
-                                 \z             # Anchor to end of string
-                             }xmsio;
+    \A             # Anchor to beginning of srtring
+    .*             # Match anything (including newline)
+    \s             # Whitespace
+    (.*?):         # Capture mail ID
+    \s             # Whitespace
+    from=<(.*?)>,  # Capture sender email address
+    \s             # Whitespace
+    size=.*?,      # Mail size (don't care)
+    \s             # Whitespace
+    nrcpt=(\d+)    # Capture number of recipients
+    .*             # Match anything (including newline)
+    \z             # Anchor to end of string
+}xmsio;
 
 
 ### NON-CONFIGURATION FILE GLOBALS (INTERNALS)
@@ -234,7 +235,7 @@ sub open_file_with_lock {
 
 sub tcp_network_server {
     # Simply return if no peers to collaborate with.
-    return if !@peers;
+    return if !@peers;  # XXX with tcp wrappers, always listen
 
     # Spawn child network server.
     my $pid = fork;
@@ -264,8 +265,7 @@ sub tcp_network_server {
     # Iterative server that spawns worker children.
     while ( !$done ) {
         # Accept new peer connection.
-        my $peer = $listener->accept;
-        next if !$peer;
+        my $peer = $listener->accept or next;
 
         # Don't exceed max number of peer connections.
         $peer_connections++;
@@ -292,7 +292,12 @@ sub tcp_network_server {
 
 sub service_peer {
     # Grab peer connection.
-    my $peer = shift;
+    my $peer = shift or return;
+
+    # Don't service self.
+    # XXX Even if we query ourselves, the code should work correctly.
+    # XXX Consider taking this line out.
+    #return if $peer->peerhost eq $listen_address;
 
     # Spawn a child worker to service peer.
     my $pid = fork;
@@ -312,6 +317,7 @@ sub service_peer {
     $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
 
     # Only service recognized peers.
+    # XXX With tcpwrappers, this isn't needed.
     if (none { $peer->peerhost eq $_ } @peers) {
         Log "Unrecognized peer connection ($peer->peerhost).";
         close $peer or Die "close failed (unrecognized peer $peer->peerhost): $!";
@@ -569,8 +575,11 @@ sub process_peer_inmates {
     # Determine if inmate transfers are required or not.
     PEERS:
     for my $peer (@peers) {
+        # Don't query self.
+        next PEERS if $peer eq $listen_address;
+
         # Create TCP network connection to peer.
-        my $sock = IO::Socket::INET->new(PeerAddr => $peer, PeerPort => $listen_port, Timeout  => 15);
+        my $sock = IO::Socket::INET->new(PeerAddr => $peer, PeerPort => $listen_port, Timeout  => 5);
 
         # Verify a good socket.
         if (!$sock) {
