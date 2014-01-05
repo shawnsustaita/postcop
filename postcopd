@@ -14,13 +14,14 @@ use Email::Sender::Simple qw/try_to_sendmail/;
 use Linux::Inotify2;
 use DBM::Deep;
 use List::MoreUtils       qw/any none/;
+use Net::TCPwrappers      qw/RQ_DAEMON RQ_FILE request_init fromhost hosts_access/;
 
 
 ### CONFIGURATION FILE GLOBALS
-my $debug                = 1;
+my $debug                = 0;
 my $foreground           = 0;
 my $alarm_time           = 5;
-my $jail_time            = 15;
+my $jail_time            = 3600;
 my $send_threshold       = 3;
 my $syslog_facility      = 'local0';
 my $syslog_priority      = 'warning';
@@ -41,7 +42,7 @@ my $to                   = 'root@localhost';
 my $subject              = 'Postcop Jailings';
 
 # Regexp that parses Postfix postmap file.
-my $jailing_regexp       = qr{
+my $jailing_regexp = qr{
     \A             # Anchor to beginning of srtring
     ([^\s]+)       # Capture inmate (ie sender addr)
     [\s]+          # Whitespace
@@ -53,7 +54,7 @@ my $jailing_regexp       = qr{
 }xmsio;
 
 # Regexp that parses Postfix mail logs.
-my $maillog_regexp       = qr{
+my $maillog_regexp = qr{
     \A             # Anchor to beginning of srtring
     .*             # Match anything (including newline)
     \s             # Whitespace
@@ -70,11 +71,6 @@ my $maillog_regexp       = qr{
 
 
 ### NON-CONFIGURATION FILE GLOBALS (INTERNALS)
-my $done                 =  0;
-my $alarm                =  0;
-my $maillog_rotated      =  0;
-my $maillog_inode        = -1;
-my $max_peer_connections =  2;
 my $pid_fh;
 my $maillog_fh;
 my $inotify;
@@ -86,6 +82,12 @@ my %pardons;
 my %inmates;
 my %new_inmates;
 my %peer_inmates;
+my $done                 =  0;
+my $alarm                =  0;
+my $maillog_rotated      =  0;
+my $maillog_inode        = -1;
+my $max_peer_connections =  2;
+my $tcp_conn_timeout     =  5;
 my $header               =  [ To      => $to,
                               From    => $from,
                               Subject => $subject ];
@@ -234,9 +236,6 @@ sub open_file_with_lock {
 
 
 sub tcp_network_server {
-    # Simply return if no peers to collaborate with.
-    return if !@peers;  # XXX with tcp wrappers, always listen
-
     # Spawn child network server.
     my $pid = fork;
     $pid < 0 and Die "fork failed (tcp_network_server): $!";
@@ -248,11 +247,13 @@ sub tcp_network_server {
     $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
 
     # Create tcp network server.
-    $listener = IO::Socket::INET->new(LocalAddr => $listen_address,
-                                      LocalPort => $listen_port,
-                                      Proto     => 'tcp',
-                                      Listen    => SOMAXCONN,
-                                      Reuse     => 1);
+    $listener = IO::Socket::INET->new(
+        LocalAddr => $listen_address,
+        LocalPort => $listen_port,
+        Proto     => 'tcp',
+        Listen    => SOMAXCONN,
+        Reuse     => 1
+    );
     $listener or Die "listener failed ($listen_address:$listen_port): $!";
 
     # KEEPALIVE will detect dead peer connections.
@@ -266,6 +267,15 @@ sub tcp_network_server {
     while ( !$done ) {
         # Accept new peer connection.
         my $peer = $listener->accept or next;
+
+        # Consult tcpwrappers for access.
+        my $req = request_init RQ_DAEMON, $0, RQ_FILE, $peer->fileno
+            or Die "request_init failed: $!";
+        fromhost($req);
+        if (!hosts_access($req)) {  # Deny access verbosely.
+            Log 'Peer access denied via tcpwrappers ('.$peer->peerhost.').';
+            next;
+        }
 
         # Don't exceed max number of peer connections.
         $peer_connections++;
@@ -294,11 +304,6 @@ sub service_peer {
     # Grab peer connection.
     my $peer = shift or return;
 
-    # Don't service self.
-    # XXX Even if we query ourselves, the code should work correctly.
-    # XXX Consider taking this line out.
-    #return if $peer->peerhost eq $listen_address;
-
     # Spawn a child worker to service peer.
     my $pid = fork;
     $pid < 0 and Die "fork failed (service_peer): $!";
@@ -316,15 +321,7 @@ sub service_peer {
     $SIG{ALRM} = $SIG{HUP} = $SIG{PIPE} = 'IGNORE';
     $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
 
-    # Only service recognized peers.
-    # XXX With tcpwrappers, this isn't needed.
-    if (none { $peer->peerhost eq $_ } @peers) {
-        Log "Unrecognized peer connection ($peer->peerhost).";
-        close $peer or Die "close failed (unrecognized peer $peer->peerhost): $!";
-        exit 0;
-    }
-
-    Log "Sharing jailings with peer ($peer->peerhost).";
+    Log 'Sharing jailings with peer ('.$peer->peerhost.').';
 
     # Share your jailings with peer.
     my $jailfh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
@@ -334,7 +331,7 @@ sub service_peer {
     close $jailfh or Die "close failed ($jail_file): $!";
     close $peer   or Die "close failed (child peer): $!";
 
-    kill -15, getpgrp;  # sig TERM to process group.
+    kill -15, getpgrp if $done;  # sig TERM to process group.
 
     exit 0;
 }
@@ -579,7 +576,11 @@ sub process_peer_inmates {
         next PEERS if $peer eq $listen_address;
 
         # Create TCP network connection to peer.
-        my $sock = IO::Socket::INET->new(PeerAddr => $peer, PeerPort => $listen_port, Timeout  => 5);
+        my $sock = IO::Socket::INET->new(
+            PeerAddr => $peer,
+            PeerPort => $listen_port,
+            Timeout  => $tcp_conn_timeout,
+        );
 
         # Verify a good socket.
         if (!$sock) {
