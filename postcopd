@@ -1,76 +1,73 @@
 #!/usr/bin/env perl
 
 
+#    Postcop is an application that monitors Postfix logs and intervenes in a
+#    Postfix fashion (ie postmap and postsuper) when mass mailers are detected.
+#    Copyright (C) 2014 Shawn Sustaita <shawn.sustaita@gmail.com>
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU Affero General Public License as
+#    published by the Free Software Foundation, either version 3 of the
+#    License, or (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU Affero General Public License for more details.
+#
+#    You should have received a copy of the GNU Affero General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
 ### MODULES
 use strict;
 use warnings;
+use version; our $VERSION = qv('0.1.0');
 use IO::File;
 use File::stat;
-use Sys::Syslog           qw/setlogsock openlog syslog/;
-use Fcntl                 qw/:DEFAULT :flock/;
-use POSIX                 qw/setsid sysconf _SC_OPEN_MAX WNOHANG/;
+use Sys::Syslog             qw/:standard :macros/;
+use Fcntl                   qw/:DEFAULT :flock/;
+use POSIX                   qw/setsid sysconf _SC_OPEN_MAX WNOHANG/;
 use IO::Socket::INET;
-use Email::Sender::Simple qw/try_to_sendmail/;
+use Email::Sender::Simple   qw/try_to_sendmail/;
 use Linux::Inotify2;
 use DBM::Deep;
-use List::MoreUtils       qw/any none/;
-use Net::TCPwrappers      qw/RQ_DAEMON RQ_FILE request_init fromhost hosts_access/;
+use List::MoreUtils         qw/any none/;
+use Net::TCPwrappers        qw/RQ_DAEMON RQ_FILE request_init fromhost hosts_access/;
+use Config::Std;
 
 
-### CONFIGURATION FILE GLOBALS
-my $debug                = 0;
-my $foreground           = 0;
-my $alarm_time           = 5;
-my $jail_time            = 3600;
-my $send_threshold       = 3;
-my $syslog_facility      = 'local0';
-my $syslog_priority      = 'warning';
-my $syslog_socktype      = 'unix';
-my $maillog_file         = '/var/log/mail.log';
-my $tmpworkdir           = '/var/lib/postcop';
-my $pardon_file          = '/etc/postfix/postcop_pardons';
-my $jail_file            = '/etc/postfix/postcop_jailings';
-my $pid_file             = '/var/run/postcopd.pid';
-my $postfix_access       = 'DISCARD Email rate limit exceeded.';
-my $postmap_cmd          = "/usr/sbin/postmap $jail_file";
-my $postsuper_cmd        = '/usr/sbin/postsuper -d-';  # Must read stdin!
-my $listen_port          = 666;
-my $listen_address       = '192.168.0.6';
-my @peers                = qw/192.168.0.6/;
-my $from                 = 'postcop@localhost';
-my $to                   = 'root@localhost';
-my $subject              = 'Postcop Jailings';
+### GLOBALS
 
-# Regexp that parses Postfix postmap file.
-my $jailing_regexp = qr{
-    \A             # Anchor to beginning of srtring
-    ([^\s]+)       # Capture inmate (ie sender addr)
-    [\s]+          # Whitespace
-    .*             # Match anything ($postfix_access)
-    [\s]           # Whitespace
-    \[([0-9]+)\]   # Capture jail time seconds
-    \s*            # Whitespace
-    \z             # Anchor to end of string
-}xmsio;
+## Configuration file variables
+## Postcop externals
+my $debug;
+my $foreground;
+my $alarm_time;
+my $jail_time;
+my $send_threshold;
+my $syslog_facility;
+my $syslog_priority;
+my $maillog_file;
+my $tmpworkdir;
+my $pardon_file;
+my $jail_file;
+my $pid_file;
+my $postfix_access;
+my $listen_port;
+my $listen_address;
+my $from;
+my $to;
+my $subject;
+my $max_peer_connections;
+my $tcp_connect_timeout;
+my $postmap_cmd;
+my $postsuper_cmd;
+my $jailing_regexp;
+my $maillog_regexp;
 
-# Regexp that parses Postfix mail logs.
-my $maillog_regexp = qr{
-    \A             # Anchor to beginning of srtring
-    .*             # Match anything (including newline)
-    \s             # Whitespace
-    (.*?):         # Capture mail ID
-    \s             # Whitespace
-    from=<(.*?)>,  # Capture sender email address
-    \s             # Whitespace
-    size=.*?,      # Mail size (don't care)
-    \s             # Whitespace
-    nrcpt=(\d+)    # Capture number of recipients
-    .*             # Match anything (including newline)
-    \z             # Anchor to end of string
-}xmsio;
-
-
-### NON-CONFIGURATION FILE GLOBALS (INTERNALS)
+## Non-configuration file variables
+## Postcop Internals
 my $pid_fh;
 my $maillog_fh;
 my $inotify;
@@ -82,15 +79,12 @@ my %pardons;
 my %inmates;
 my %new_inmates;
 my %peer_inmates;
-my $done                 =  0;
-my $alarm                =  0;
-my $maillog_rotated      =  0;
-my $maillog_inode        = -1;
-my $max_peer_connections =  2;
-my $tcp_conn_timeout     =  5;
-my $header               =  [ To      => $to,
-                              From    => $from,
-                              Subject => $subject ];
+my @peers;
+my $syslogging            =  0;
+my $done                  =  0;
+my $alarm                 =  0;
+my $maillog_rotated       =  0;
+my $maillog_inode         = -1;
 
 
 ### DECLARATIONS
@@ -98,7 +92,6 @@ sub main;
 sub initialize;
 sub finalize;
 sub init_signals;
-sub init_syslog;
 sub daemonize;
 sub create_locked_pid_file;
 sub open_file_with_lock;
@@ -121,6 +114,8 @@ sub postmap;
 sub postsuper;
 sub notify_admins;
 sub Die;
+sub parse_config;
+sub compile_regexp;
 
 
 ### MAIN
@@ -149,9 +144,9 @@ sub main {
 
 sub initialize {
     $0 = 'postcopd';
+    parse_config;
     init_signals;
     $| = 1      if  $foreground;  # Autoflush
-    init_syslog if !$foreground;
     daemonize   if !$foreground;
     create_locked_pid_file;
     tcp_network_server;
@@ -177,13 +172,6 @@ sub init_signals {
     $SIG{HUP} = 'IGNORE';
     $SIG{ALRM} = sub { $alarm = 1; };
     $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
-    return;
-}
-
-
-sub init_syslog {
-    setlogsock $syslog_socktype or die "setlogsock failed ($syslog_socktype): $!";
-    openlog $0, 'pid', $syslog_facility;  # Will die on failure (perldoc Sys::Syslog)
     return;
 }
 
@@ -283,6 +271,7 @@ sub tcp_network_server {
             Log "maximum peer connections reached ($max_peer_connections).";
             Log "Ignoring connection ($peer->peerhost).";
             $peer_connections--;
+            close $peer or Die "close failed (peer): $!";
             next;
         }
 
@@ -293,6 +282,10 @@ sub tcp_network_server {
         $peer_connections-- while (waitpid(-1, WNOHANG) > 0);
     }
     close $listener or Die "close failed (listener): $!";
+
+    # XXX - I'm seeing init inherit postcop proc.  Find where problem
+    # resides and fix.  This may or may not be needed.
+    #while (wait >= 0) { }
 
     kill -15, getpgrp;  # sig TERM to process group.
 
@@ -378,6 +371,10 @@ sub Log {
         STDOUT->flush;
     }
     else {
+        if (!$syslogging) {
+            openlog $0, 'pid', $syslog_facility;
+            $syslogging = 1;
+        }
         syslog $syslog_priority, $log;
     }
 
@@ -579,7 +576,7 @@ sub process_peer_inmates {
         my $sock = IO::Socket::INET->new(
             PeerAddr => $peer,
             PeerPort => $listen_port,
-            Timeout  => $tcp_conn_timeout,
+            Timeout  => $tcp_connect_timeout,
         );
 
         # Verify a good socket.
@@ -732,14 +729,22 @@ sub notify_admins {
     # Return if nothing to do.
     return if !%new_inmates;
 
+    # Build email header.
+    my $header = [ To      => $to,
+                   From    => $from,
+                   Subject => $subject, ];
+
     # Build body; Newline separated list of new jailings.
     my $body;
     while (my ($new_inmate, undef) = each %new_inmates) {
         $body .= "$new_inmate\n";
     }
 
-    # Build email.
-    my $email = Email::Simple->create(header => $header, body => $body);
+    # Build complete email with header and body.
+    my $email = Email::Simple->create(
+        header => $header,
+        body   => $body,
+    );
 
     # Best effort attempt to send new jailings to admin address.
     # Utilizes system sendmail command.
@@ -775,4 +780,173 @@ sub is_peer_inmate {
     return defined $peer_inmates{$sender};
 }
 
+sub compile_regexp {
+    my $regexp = shift // return;
+    return eval { qr/$regexp/xmsi };
+}
 
+sub parse_config {
+    my $config_file = $ARGV[0] // '/etc/postcop/postcopd.conf';
+    my %conf;
+
+    eval { read_config $config_file => %conf };
+    Die "parse_config failed ($config_file): $@" if $@;
+
+    ## Parse config with sane defaults.
+
+    # Be verbose.
+    $debug = $conf{''}{debug}                                  // 0;
+
+    # To daemonize or not to daemonize.
+    $foreground = $conf{''}{foreground}                        // 0;
+
+    # Mail logs will be captured for $alarm_time duration
+    # (in seconds) intervals before being processed.
+    $alarm_time = $conf{''}{alarm_time}                        // 60;
+
+    # If sender hits mail sending threshold in $alarm_time
+    # duration, sender is put in jail for $jail_time duration
+    # (in seconds) rounded up to next $alarm_time.
+    $send_threshold = $conf{''}{send_threshold}                // 100;
+
+    # Amount of time (in seconds) a sender will be in jail.
+    $jail_time = $conf{''}{jail_time}                          // 60 * 60;
+
+    # Location of Postfix access(5) file.
+    # This is the so-called jail.
+    $jail_file = $conf{''}{jail_file}                          // '/etc/postcop/postcop_jailings';
+
+    # Location of Postfix access(5) file.
+    # Those above the law.  Those that never do jail time.
+    $pardon_file = $conf{''}{pardon_file}                      // '/etc/postcop/postcop_pardons';
+
+    # Postfix access(5) action.  REJECT, DISCARD, HOLD, etc.
+    # This is an offender's jail sentence.
+    $postfix_access = $conf{''}{postfix_access}                // 'REJECT email rate limit exceeded.';
+
+    # The command that sentences new offenders jail time.
+    # This is passed to the perl builtin - system.
+    # Postfix needs hooks into this lookup table.
+    # perldoc -f system
+    # access(5)
+    # postmap(1)
+    # postconf(5) - smtpd_sender_restrictions
+    $postmap_cmd = $conf{''}{postmap_cmd}                      // "/usr/sbin/postmap $jail_file";
+
+    # The command that processes new offenders' queued mail.
+    # This command must read from stdin!
+    # postsuper(1)
+    $postsuper_cmd = $conf{''}{postsuper_cmd}                  // '/usr/sbin/postsuper -h-';
+
+    # Regular expression to parse jail file.
+    # Postcop needs to capture inmate and jail sentence (in seconds).
+    $jailing_regexp = compile_regexp $conf{''}{jailing_regexp} // qr{
+        \A             # Anchor to beginning of srtring
+        ([^\s]+)       # Capture inmate (ie sender addr)
+        [\s]+          # Whitespace
+        .*             # Match anything ($postfix_access)
+        [\s]           # Whitespace
+        \[ ([0-9]+) \] # Capture jail time seconds
+        \s*            # Whitespace
+        \z             # Anchor to end of string
+    }xmsi;
+
+    # Regular expression to parse Postfix mail logs.
+    # This is vital to the proper functioning of postcop.
+    # Postcop needs to capture mail ID, sender and number of recipients.
+    $maillog_regexp = compile_regexp $conf{''}{maillog_regexp} // qr{
+        \A             # Anchor to beginning of srtring
+        .*             # Match anything
+        \s             # Whitespace
+        (.*?):         # Capture mail ID
+        \s             # Whitespace
+        from=<(.*?)>,  # Capture sender email address
+        \s             # Whitespace
+        size=.*?,      # Mail size (don't care)
+        \s             # Whitespace
+        nrcpt=(\d+)    # Capture number of recipients
+        .*             # Match anything
+        \z             # Anchor to end of string
+    }xmsi;
+
+    # Syslog facility (perldoc Sys::Syslog)
+    $syslog_facility = $conf{''}{syslog_facility}              // LOG_DAEMON;
+
+    # Syslog priority (perldoc Sys::Syslog)
+    $syslog_priority = $conf{''}{syslog_priority}              // LOG_INFO;
+
+    # Postcop will send notifications of new jailing to admins
+    # with sender address $from.
+    $from = $conf{''}{from}                                    // 'postcop@localhost';
+
+    # Postcop will send notifications of new jailing to admins
+    # with recipient address $to.
+    $to = $conf{''}{to}                                        // 'root@localhost';
+
+    # Postcop will send notifications of new jailing to admins
+    # with subject line $subject.
+    $subject = $conf{''}{subject}                              // 'postcop jailings';
+
+    # Location of Postfix mail log.
+    $maillog_file = $conf{''}{maillog_file}                    // '/var/log/mail.log';
+
+    # Temporary working directory.  Do not touch!
+    $tmpworkdir = $conf{''}{tmpworkdir}                        // '/var/lib/postcop';
+
+    # Location of daemon PID file.
+    $pid_file = $conf{''}{pid_file}                            // '/var/run/postcopd.pid';
+
+    # To fight DOS attacks, postcop will only accept
+    # $max_peer_connections connections.
+    $max_peer_connections = $conf{''}{max_peer_connections}    // 10;
+
+    # Connection timeout when connecting to a peer.
+    $tcp_connect_timeout = $conf{''}{tcp_connect_timeout}      // 5;
+
+    # TCP port postcopd will listen on.
+    $listen_port = $conf{''}{listen_port}                      // 1234;
+
+    # TCP interface postcopd will listen on.  Lacking a value,
+    # postcopd will listen on all interfaces.
+    $listen_address = $conf{''}{listen_address}                // undef;
+
+    # Peers that postcop queries for inmates populations.
+    if (defined $conf{''}{peer}) {
+        if (ref $conf{''}{peer} eq 'ARRAY') {
+            @peers = @{ $conf{''}{peer} };
+        }
+        else {
+            push @peers, $conf{''}{peer};
+        }
+    }
+
+    if ($debug) {
+        Log "debug = $debug";
+        Log "foreground = $foreground";
+        Log "syslog_facility = $syslog_facility";
+        Log "syslog_priority = $syslog_priority";
+        Log "alarm_time = $alarm_time";
+        Log "send_threshold = $send_threshold";
+        Log "jail_time = $jail_time";
+        Log "maillog_file = $maillog_file";
+        Log "tmpworkdir = $tmpworkdir";
+        Log "pardon_file = $pardon_file";
+        Log "jail_file = $jail_file";
+        Log "pid_file = $pid_file";
+        Log "postfix_access = $postfix_access";
+        Log "listen_port = $listen_port";
+        Log "listen_address = " . ($listen_address ?  $listen_address : '0.0.0.0');
+        Log "from = $from";
+        Log "to = $to";
+        Log "subject = $subject";
+        Log "max_peer_connections = $max_peer_connections";
+        Log "tcp_connect_timeout = $tcp_connect_timeout";
+        Log "postmap_cmd = $postmap_cmd";
+        Log "postsuper_cmd = $postsuper_cmd";
+        Log "jailing_regexp = $jailing_regexp";
+        Log "maillog_regexp = $maillog_regexp";
+        Log "peer = $_" for @peers;
+    }
+
+    return;
+}
