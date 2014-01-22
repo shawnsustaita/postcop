@@ -314,7 +314,7 @@ sub service_peer {
     $SIG{ALRM} = $SIG{HUP} = $SIG{PIPE} = 'IGNORE';
     $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
 
-    Log 'Sharing jailings with peer ('.$peer->peerhost.').';
+    Log 'Sharing jailings with peer ('.$peer->peerhost.').' if $debug;
 
     # Share your jailings with peer.
     my $jailfh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
@@ -570,7 +570,11 @@ sub process_peer_inmates {
     PEERS:
     for my $peer (@peers) {
         # Don't query self.
-        next PEERS if $peer eq $listen_address;
+        # XXX - $listen_address can be undef (use of uninitialized...)
+        # XXX - Find alternate way to see if peer is self.
+        # XXX - perhaps it's ok to query self due to misconfiguration.
+        # XXX - let's try it.  I'll comment out following line.
+        #next PEERS if $peer eq $listen_address;
 
         # Create TCP network connection to peer.
         my $sock = IO::Socket::INET->new(
