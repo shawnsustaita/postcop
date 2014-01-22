@@ -25,16 +25,14 @@ use warnings;
 use version; our $VERSION = qv('0.1.0');
 use IO::File;
 use File::stat;
-use Sys::Syslog             qw/:standard :macros/;
-use Fcntl                   qw/:DEFAULT :flock/;
-use POSIX                   qw/setsid sysconf _SC_OPEN_MAX WNOHANG/;
-use IO::Socket::INET;
-use Email::Sender::Simple   qw/try_to_sendmail/;
 use Linux::Inotify2;
 use DBM::Deep;
-use List::MoreUtils         qw/any none/;
-use Net::TCPwrappers        qw/RQ_DAEMON RQ_FILE request_init fromhost hosts_access/;
 use Config::Std;
+use Sys::Syslog           qw/:standard :macros/;
+use Fcntl                 qw/:DEFAULT :flock/;
+use POSIX                 qw/setsid sysconf _SC_OPEN_MAX/;
+use Email::Sender::Simple qw/try_to_sendmail/;
+use List::MoreUtils       qw/any none/;
 
 
 ### GLOBALS
@@ -54,13 +52,9 @@ my $pardon_file;
 my $jail_file;
 my $pid_file;
 my $postfix_access;
-my $listen_port;
-my $listen_address;
 my $from;
 my $to;
 my $subject;
-my $max_peer_connections;
-my $tcp_connect_timeout;
 my $postmap_cmd;
 my $postsuper_cmd;
 my $jailing_regexp;
@@ -71,20 +65,17 @@ my $maillog_regexp;
 my $pid_fh;
 my $maillog_fh;
 my $inotify;
-my $listener;
 my %sender_mail_ids;
 my %sender_mail_logs;
 my %sender_mail_counts;
 my %pardons;
 my %inmates;
 my %new_inmates;
-my %peer_inmates;
-my @peers;
-my $syslogging            =  0;
-my $done                  =  0;
-my $alarm                 =  0;
-my $maillog_rotated       =  0;
-my $maillog_inode         = -1;
+my $syslogging          =  0;
+my $done                =  0;
+my $alarm               =  0;
+my $maillog_rotated     =  0;
+my $maillog_inode       = -1;
 
 
 ### DECLARATIONS
@@ -95,19 +86,15 @@ sub init_signals;
 sub daemonize;
 sub create_locked_pid_file;
 sub open_file_with_lock;
-sub service_peer;
-sub tcp_network_server;
 sub init_maillog;
 sub Log;
 sub tie_db_vars;
 sub init_db_vars;
 sub is_pardoned;
 sub is_inmate;
-sub is_peer_inmate;
 sub process_maillogs;
 sub process_pardons;
 sub process_inmates;
-sub process_peer_inmates;
 sub process_new_inmates;
 sub process_jail_sentences;
 sub postmap;
@@ -130,7 +117,6 @@ sub main {
         process_maillogs;
         process_pardons;
         process_inmates;
-        process_peer_inmates;
         process_new_inmates;
         process_jail_sentences;
         postmap;
@@ -149,7 +135,6 @@ sub initialize {
     $| = 1      if  $foreground;  # Autoflush
     daemonize   if !$foreground;
     create_locked_pid_file;
-    tcp_network_server;
     init_maillog;
     tie_db_vars;
     Log "Postcop started.";
@@ -223,113 +208,6 @@ sub open_file_with_lock {
 }
 
 
-sub tcp_network_server {
-    # Spawn child network server.
-    my $pid = fork;
-    $pid < 0 and Die "fork failed (tcp_network_server): $!";
-    $pid > 0 and return;  # parent
-    # child...
-
-    # Adjust signals accordingly.
-    $SIG{ALRM} = $SIG{HUP} = 'IGNORE';
-    $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
-
-    # Create tcp network server.
-    $listener = IO::Socket::INET->new(
-        LocalAddr => $listen_address,
-        LocalPort => $listen_port,
-        Proto     => 'tcp',
-        Listen    => SOMAXCONN,
-        Reuse     => 1
-    );
-    $listener or Die "listener failed ($listen_address:$listen_port): $!";
-
-    # KEEPALIVE will detect dead peer connections.
-    $listener->setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
-        or Die "setsockopt failed (SOL_SOCKET:SO_KEEPALIVE): $!";
-
-    # Keep track of the number of peer connections.
-    my $peer_connections = 0;
-
-    # Iterative server that spawns worker children.
-    while ( !$done ) {
-        # Accept new peer connection.
-        my $peer = $listener->accept or next;
-
-        # Consult tcpwrappers for access.
-        my $req = request_init RQ_DAEMON, $0, RQ_FILE, $peer->fileno
-            or Die "request_init failed: $!";
-        fromhost($req);
-        if (!hosts_access($req)) {  # Deny access verbosely.
-            Log 'Peer access denied via tcpwrappers ('.$peer->peerhost.').';
-            next;
-        }
-
-        # Don't exceed max number of peer connections.
-        $peer_connections++;
-        if ($peer_connections > $max_peer_connections) {
-            Log "maximum peer connections reached ($max_peer_connections).";
-            Log "Ignoring connection ($peer->peerhost).";
-            $peer_connections--;
-            close $peer or Die "close failed (peer): $!";
-            next;
-        }
-
-        # Service_peer spawns a child worker to service peer.
-        service_peer $peer;
-
-        # Reap zombies and adjust peer connection count accordingly.
-        $peer_connections-- while (waitpid(-1, WNOHANG) > 0);
-    }
-    close $listener or Die "close failed (listener): $!";
-
-    # XXX - I'm seeing init inherit postcop proc.  Find where problem
-    # resides and fix.  This may or may not be needed.
-    #while (wait >= 0) { }
-
-    kill -15, getpgrp;  # sig TERM to process group.
-
-    exit 0;
-}
-
-
-sub service_peer {
-    # Grab peer connection.
-    my $peer = shift or return;
-
-    # Spawn a child worker to service peer.
-    my $pid = fork;
-    $pid < 0 and Die "fork failed (service_peer): $!";
-    if ($pid > 0) {  # Parent.
-        # For child only.  Parent can close.
-        close $peer or Die "close failed (parent peer): $!";
-        return;
-    }
-    # Child...
-
-    # For parent only.  Child can close.
-    close $listener or Die "close failed (listener): $!";
-
-    # Adjust signals accordingly.
-    $SIG{ALRM} = $SIG{HUP} = $SIG{PIPE} = 'IGNORE';
-    $SIG{TERM} = $SIG{INT} = sub { $done = 1; };
-
-    Log 'Sharing jailings with peer ('.$peer->peerhost.').' if $debug;
-
-    # Share your jailings with peer.
-    my $jailfh = open_file_with_lock $jail_file, O_RDONLY|O_CREAT, LOCK_SH;
-    while (!$done and my $line = <$jailfh>) {
-        print $peer $line;
-    }
-    close $jailfh or Die "close failed ($jail_file): $!";
-    close $peer   or Die "close failed (child peer): $!";
-
-    kill -15, getpgrp if $done;  # sig TERM to process group.
-
-    exit 0;
-}
-
-
 sub init_maillog {
     # Open mail log.
     my $open_attempts = 5;
@@ -394,8 +272,6 @@ sub tie_db_vars {
         or Die "Tie failed (inmates): $!";
     tie %new_inmates, 'DBM::Deep', $tmpworkdir.'/new_inmates.db'
         or Die "Tie failed (new_inmates): $!";
-    tie %peer_inmates, 'DBM::Deep', $tmpworkdir.'/peer_inmates.db'
-        or Die "Tie failed (peer_inmates): $!";
     tie %pardons, 'DBM::Deep', $tmpworkdir.'/pardons.db'
         or Die "Tie failed (pardons): $!";
     return;
@@ -408,7 +284,6 @@ sub init_db_vars {
     %sender_mail_logs   = ();
     %inmates            = ();
     %new_inmates        = ();
-    %peer_inmates       = ();
     %pardons            = ();
     return;
 }
@@ -504,8 +379,8 @@ sub process_pardons {
         }
 
         # Populate data structures for later processing.
-        Log "\$pardons{$line}" if $debug;
-        $pardons{$line} = '1';  # Appease compiler with assignment.
+        Log "\$pardons{$line} = 1" if $debug;
+        $pardons{$line} = 1;  # Appease compiler with assignment.
     }
     close $pardonfh or Die "close failed ($pardon_file)";
 
@@ -561,75 +436,8 @@ sub process_inmates {
 }
 
 
-sub process_peer_inmates {
-    # Time now is for timestamping peer jail transfers.
-    my $now = time;
-
-    # Iterate peers.
-    # Determine if inmate transfers are required or not.
-    PEERS:
-    for my $peer (@peers) {
-        # Don't query self.
-        # XXX - $listen_address can be undef (use of uninitialized...)
-        # XXX - Find alternate way to see if peer is self.
-        # XXX - perhaps it's ok to query self due to misconfiguration.
-        # XXX - let's try it.  I'll comment out following line.
-        #next PEERS if $peer eq $listen_address;
-
-        # Create TCP network connection to peer.
-        my $sock = IO::Socket::INET->new(
-            PeerAddr => $peer,
-            PeerPort => $listen_port,
-            Timeout  => $tcp_connect_timeout,
-        );
-
-        # Verify a good socket.
-        if (!$sock) {
-            Log "sock failed ($peer:$listen_port): $!";
-            next PEERS;
-        }
-
-        # Iterate peer jailings.
-        JAILINGS:
-        while (my $line = <$sock>) {
-            # Remove newline.
-            chomp $line;
-
-            # Jail policies (ie $postfix_access) must be identical for inmate transfers.
-            if ($line !~ $jailing_regexp) {
-                Log "Ignoring malformed jail entry: $line";
-                next JAILINGS;
-            }
-            
-            # Assign extracted data to appropriate variables.
-            my ($sender, $then) = (lc $1, $2);
-
-            # Verify good data or ignore verbosely.
-            if (!defined($sender) and !defined($then)) {
-                Log "ignoring malformed jail entry: $line";
-                next JAILINGS;
-            }
-
-            # Ignore sender if already processed.
-            next if is_pardoned($sender);
-            next if is_inmate($sender);
-
-            # Populate data structures for later processing.
-            Log "$sender has been sentenced jail time via peer collaboration ($peer).";
-            Log "\$peer_inmates{$sender} = $sender $postfix_access [$now]" if $debug;
-            $peer_inmates{$sender} = "$sender $postfix_access [$now]";
-        }  # end JAILINGS
-
-        close $sock;
-
-    }  # end PEERS
-
-    return;
-}
-
-
 sub process_new_inmates {
-    # Time now is for timestamping peer jail transfers.
+    # Time now is for timestamping jailings.
     my $now = time;
 
     # Iterate new senders.
@@ -645,7 +453,6 @@ sub process_new_inmates {
         # Ignore sender if already processed.
         next if is_pardoned($sender);
         next if is_inmate($sender);
-        next if is_peer_inmate($sender);
 
         Log "$sender has been jailed ($count emails per $alarm_time seconds).";
 
@@ -674,12 +481,6 @@ sub process_jail_sentences {
 
     # Jail existing inmates.
     while (my (undef, $jailing) = each %inmates) {
-        Log "print \$jailfh $jailing" if $debug;
-        print $jailfh "$jailing\n" or Die "write failed ($jail_file): $!";
-    }
-
-    # Jail peer inmates.
-    while (my (undef, $jailing) = each %peer_inmates) {
         Log "print \$jailfh $jailing" if $debug;
         print $jailfh "$jailing\n" or Die "write failed ($jail_file): $!";
     }
@@ -779,15 +580,11 @@ sub is_inmate {
 }
 
 
-sub is_peer_inmate {
-    my $sender = shift;
-    return defined $peer_inmates{$sender};
-}
-
 sub compile_regexp {
     my $regexp = shift // return;
     return eval { qr/$regexp/xmsi };
 }
+
 
 sub parse_config {
     my $config_file = $ARGV[0] // '/etc/postcop/postcopd.conf';
@@ -900,29 +697,6 @@ sub parse_config {
     # Location of daemon PID file.
     $pid_file = $conf{''}{pid_file}                            // '/var/run/postcopd.pid';
 
-    # To fight DOS attacks, postcop will only accept
-    # $max_peer_connections connections.
-    $max_peer_connections = $conf{''}{max_peer_connections}    // 10;
-
-    # Connection timeout when connecting to a peer.
-    $tcp_connect_timeout = $conf{''}{tcp_connect_timeout}      // 5;
-
-    # TCP port postcopd will listen on.
-    $listen_port = $conf{''}{listen_port}                      // 1234;
-
-    # TCP interface postcopd will listen on.  Lacking a value,
-    # postcopd will listen on all interfaces.
-    $listen_address = $conf{''}{listen_address}                // undef;
-
-    # Peers that postcop queries for inmates populations.
-    if (defined $conf{''}{peer}) {
-        if (ref $conf{''}{peer} eq 'ARRAY') {
-            @peers = @{ $conf{''}{peer} };
-        }
-        else {
-            push @peers, $conf{''}{peer};
-        }
-    }
 
     if ($debug) {
         Log "debug = $debug";
@@ -938,18 +712,13 @@ sub parse_config {
         Log "jail_file = $jail_file";
         Log "pid_file = $pid_file";
         Log "postfix_access = $postfix_access";
-        Log "listen_port = $listen_port";
-        Log "listen_address = " . ($listen_address ?  $listen_address : '0.0.0.0');
         Log "from = $from";
         Log "to = $to";
         Log "subject = $subject";
-        Log "max_peer_connections = $max_peer_connections";
-        Log "tcp_connect_timeout = $tcp_connect_timeout";
         Log "postmap_cmd = $postmap_cmd";
         Log "postsuper_cmd = $postsuper_cmd";
         Log "jailing_regexp = $jailing_regexp";
         Log "maillog_regexp = $maillog_regexp";
-        Log "peer = $_" for @peers;
     }
 
     return;
