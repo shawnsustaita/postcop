@@ -1,9 +1,8 @@
 #!/usr/bin/env perl
 
 
-#    Postcop is an application that monitors Postfix logs and intervenes in a
-#    Postfix fashion (ie postmap and postsuper) when mass mailers are detected.
-#    Copyright (C) 2014 Shawn Sustaita <shawn.sustaita@gmail.com>
+#    Copyright (C) 2014 Shawn Sustaita <shawn.sustaita@gmail.com>.
+#    All rights reserved.
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU Affero General Public License as
