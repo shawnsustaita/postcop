@@ -4,29 +4,27 @@ Postcop - Defends against Postfix unauthorized mass mailers.
 
 =head1 VERSION
 
-This documentation refers to Postcop version 0.1.0
+This documentation refers to Postcop version 1.20140123
 
 =head1 SYNOPSIS
 
 postcop
-postcop /etc/postcop/postcopd.conf  # Default config
-postcop /path/to/alt/config/file
+
+=head1 OPTIONS
+
+Postcop takes an optional configuration file argument.  The default configuration option is /etc/postcop/postcopd.conf
 
 =head1 DESCRIPTION
 
-Postcop is an application that monitors Postfix logs and blocks unauthorized mass mailers in a Postfix fashion via postmap and postsuper.
+Postcop is an daemon that monitors Postfix logs and blocks unauthorized mass mailers in a Postfix fashion via postmap and postsuper.
 
 =head1 CONFIGURATION
 
-Postcop's default config file is /etc/postcop/postcopd.conf and is in standard INI format.
+Postcop's default config file is /etc/postcop/postcopd.conf and is in standard INI format.  See comments in the default configuration file - postcopd.conf - for details.
 
 =head1 DEPENDENCIES
 
-Linux::Inotify2, DBM::Deep, Config::Std, Sys::Syslog, Email::Sender::Simple, List::MoreUtils
-
-=head1 INCOMPATIBILITIES
-
-Postcop only runs on Linux due to the use of the inotify filesystem event notification system.  The inotify API is Linux-specific.
+DBM::Deep, Config::Std, Sys::Syslog, Email::Sender::Simple, List::MoreUtils
 
 =head1 BUGS AND LIMITATIONS
 

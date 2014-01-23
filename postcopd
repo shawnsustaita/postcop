@@ -58,6 +58,7 @@ my $postmap_cmd;
 my $postsuper_cmd;
 my $jailing_regexp;
 my $maillog_regexp;
+my $sleep_time;
 
 ## Non-configuration file variables
 ## Postcop Internals
@@ -220,13 +221,6 @@ sub init_maillog {
     # The inode is used to deduce when a log rotation occurs.
     $maillog_inode = stat($maillog_fh)->ino or Die "stat failed: $!";
 
-    # When processing the mail log and there's no activity, go to sleep until
-    # a mail log event occurs via the Linux inotify mechanism.  Perhaps this
-    # is better than just explicitly sleeping for a set time period.
-    $inotify = Linux::Inotify2->new or Die "inotify new error: $!";
-    $inotify->watch(readlink('/proc/'.$$.'/fd/'.fileno($maillog_fh)), IN_ALL_EVENTS)
-        or Die "inotify watch error: $!";
-
     # Log rotated so start at beginning (not end) of new log file.
     if ($maillog_rotated) {
         $maillog_rotated = 0;
@@ -302,7 +296,7 @@ sub process_maillogs {
             $maillog_fh->clearerr;
 
             # If log rotated, set an indicator flag.
-            if ($maillog_file ne readlink('/proc/'.$$.'/fd/'.fileno($maillog_fh))) {
+            if ($maillog_inode != (stat($maillog_file)->ino or Die "stat failed: $!")) {
                 $maillog_rotated = 1;
             }
 
@@ -314,7 +308,8 @@ sub process_maillogs {
             }
             # if EOF and log not rotated, sleep until next log event.
             else {
-                $inotify->read;
+                select undef, undef, undef, $sleep_time;
+                # XXX - need to test ret val!
             }
         }
 
@@ -695,6 +690,9 @@ sub parse_config {
 
     # Location of daemon PID file.
     $pid_file = $conf{''}{pid_file}                            // '/var/run/postcopd.pid';
+
+    # When processing mail logs, sleep this amount of seconds at EOF.
+    $sleep_time = $conf{''}{sleep_time}                        // 1;
 
 
     if ($debug) {
