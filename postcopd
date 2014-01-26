@@ -24,7 +24,6 @@ use warnings;
 use version; our $VERSION = qv('0.1.0');
 use IO::File;
 use File::stat;
-use Linux::Inotify2;
 use DBM::Deep;
 use Config::Std;
 use Sys::Syslog           qw/:standard :macros/;
@@ -162,28 +161,36 @@ sub init_signals {
 
 
 sub daemonize {
-    # Be inherited by init.
+    # Become background process.
     my $pid = fork;
     $pid < 0 and Die "fork failed (daemonize): $!";
     $pid > 0 and exit 0;  # Lose parent
   
+    # Acquire session lead.
+    my $sid = setsid;
+    $sid < 0 and Die "setsid failed: $!";
+
+    # Lose session lead.
+    $pid = fork;
+    $pid < 0 and Die "fork failed (daemonize): $!";
+    $pid > 0 and exit 0;  # Lose parent
+
     # Set sane working directory and umask.
     chdir '/' or Die "chdir failed: $!";
     umask 022;
   
-    # Establish a new session.
-    my $sid = setsid;
-    $sid < 0 and Die "setsid failed: $!";
-
-    # Close whatever files that were previously open.
+    # Close files.
     my $openmax = sysconf(_SC_OPEN_MAX);
     $openmax > 0 or $openmax = 1024;
     POSIX::close $_ for 0 .. $openmax;
   
     # Open std{in,out,err} from/to /dev/null.
-    open STDIN,  '<', '/dev/null' or Die "open STDIN failed (/dev/null): $!";
-    open STDOUT, '>', '/dev/null' or Die "open STDOUT failed (/dev/null): $!";
-    open STDERR, '>', '/dev/null' or Die "open STDERR failed (/dev/null): $!";
+    open STDIN,  '+<', '/dev/null' or Die "open STDIN failed (/dev/null): $!";
+    open STDOUT, '+<', '/dev/null' or Die "open STDOUT failed (/dev/null): $!";
+    open STDERR, '+<', '/dev/null' or Die "open STDERR failed (/dev/null): $!";
+
+    # Ensure STD{IN,OUT,ERR} are mapped to 0, 1 and 2.
+    Die "open STDIN failed (STDIN->filno != 0)" if STDIN->filno != 0;
 
     return;
 }
