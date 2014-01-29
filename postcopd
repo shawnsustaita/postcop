@@ -315,8 +315,10 @@ sub process_maillogs {
             }
             # if EOF and log not rotated, sleep until next log event.
             else {
+                # Alternative to mixing alarm/sleep.
+                # perldoc -f alarm
+                # perldoc -f sleep
                 select undef, undef, undef, $sleep_time;
-                # XXX - need to test ret val!
             }
         }
 
