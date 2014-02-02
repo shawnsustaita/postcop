@@ -26,6 +26,10 @@ Postcop's default config file is /etc/postcop/postcopd.conf and is in standard I
 
 DBM::Deep, Config::Std, Sys::Syslog, Email::Sender::Simple, List::MoreUtils
 
+=head1 SOURCE CODE
+
+The source code repository is at https://github.com/shawnsustaita/postcop.
+
 =head1 BUGS AND LIMITATIONS
 
 There are no known bugs in this app.
