@@ -1,41 +1,52 @@
 NAME
+
     Postcop - Defends against Postfix unauthorized mass mailers.
 
 VERSION
-    This documentation refers to Postcop version 1.20140123
+
+    This documentation refers to Postcop version 0.1.0
 
 SYNOPSIS
+
     postcop
 
 OPTIONS
+
     Postcop takes an optional configuration file argument. The default
     configuration option is /etc/postcop/postcopd.conf
 
 DESCRIPTION
+
     Postcop is an daemon that monitors Postfix logs and blocks unauthorized
     mass mailers in a Postfix fashion via postmap and postsuper.
 
 CONFIGURATION
+
     Postcop's default config file is /etc/postcop/postcopd.conf and is in
     standard INI format. See comments in the default configuration file -
     postcopd.conf - for details.
 
 DEPENDENCIES
+
     DBM::Deep, Config::Std, Sys::Syslog, Email::Sender::Simple,
     List::MoreUtils
 
 SOURCE CODE
+
     The source code repository is at
     https://github.com/shawnsustaita/postcop.
 
 BUGS AND LIMITATIONS
+
     There are no known bugs in this app. Please report problems to Shawn
     Sustaita <shawn.sustaita@gmail.com> Patches are welcome.
 
 AUTHOR
+
     Shawn Sustaita <shawn.sustaita@gmail.com>
 
 LICENSE AND COPYRIGHT
+
     Copyright (C) 2014 Shawn Sustaita <shawn.sustaita@gmail.com>. All rights
     reserved.
 

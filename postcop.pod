@@ -4,7 +4,7 @@ Postcop - Defends against Postfix unauthorized mass mailers.
 
 =head1 VERSION
 
-This documentation refers to Postcop version 1.20140123
+This documentation refers to Postcop version 0.1.0
 
 =head1 SYNOPSIS
 
