@@ -189,7 +189,7 @@ sub daemonize {
     open STDERR, '+<', '/dev/null' or Die "open STDERR failed (/dev/null): $!";
 
     # Ensure STD{IN,OUT,ERR} are mapped to 0, 1 and 2.
-    Die "open STDIN failed (STDIN->filno != 0)" if STDIN->filno != 0;
+    Die "open STDIN failed (fileno(STDIN) != 0)" if fileno(STDIN) != 0;
 
     return;
 }
