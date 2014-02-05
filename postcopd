@@ -147,7 +147,6 @@ sub finalize {
     Log "Postcop finished.";
     unlink glob "$tmpworkdir/*.db";
     unlink $pid_file;
-    kill -15, getpgrp;  # sig TERM process group.
     return;
 }
 
@@ -564,7 +563,6 @@ sub Die {
     my $msg = shift;
     Log $msg;
     Log "Postcop died unexpectedly.";
-    kill -15, getpgrp;  # Sig TERM process group.
     exit 1;
 }
 
