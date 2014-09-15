@@ -24,7 +24,29 @@ Postcop's default config file is /etc/postcop/postcopd.conf and is in standard I
 
 =head1 DEPENDENCIES
 
-DBM::Deep, Config::Std, Sys::Syslog, Email::Sender::Simple, List::MoreUtils
+=over
+
+=item *
+
+DBM::Deep
+
+=item *
+
+Config::Std
+
+=item *
+
+Sys::Syslog
+
+=item *
+
+Email::Sender::Simple
+
+=item *
+
+List::MoreUtils
+
+=back
 
 =head1 SOURCE CODE
 
